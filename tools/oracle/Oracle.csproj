@@ -1,0 +1,22 @@
+<!--
+SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+
+SPDX-License-Identifier: MIT OR Apache-2.0
+-->
+
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Build with: dotnet build -c Release -p:RVWorldDir=/path/to/RVWorld
+       On Linux, Compress.csproj refers to ../Libraries/{RVIO,RVZstdSharp,SortMethods}
+       but they live in libraries/; first run in the RVWorld checkout:
+       for d in libraries/*; do ln -sfn ../$d Libraries/; done -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="$(RVWorldDir)/Compress/Compress.csproj" />
+    <ProjectReference Include="$(RVWorldDir)/libraries/SortMethods/SortMethods.csproj" />
+    <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
+  </ItemGroup>
+</Project>

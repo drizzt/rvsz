@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # zstd-sys is pinned to =2.0.9 (libzstd 1.5.5): a newer libzstd can
+    # change the compressed bytes, and output must match RomVault exactly.
+    ignore:
+      - dependency-name: "zstd-sys"
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      actions:
+        patterns:
+          - "*"

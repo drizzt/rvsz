@@ -1,0 +1,982 @@
+// SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn bin() -> Command {
+    Command::new(env!("CARGO_BIN_EXE_rvsz"))
+}
+
+fn tmp(name: &str) -> PathBuf {
+    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = fs::remove_dir_all(&d);
+    fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn ok(c: &mut Command) -> bool {
+    c.output().unwrap().status.success()
+}
+
+/// Small corpus with every name/entry kind the format distinguishes.
+fn corpus(root: &Path) {
+    fs::create_dir_all(root.join("emptydir")).unwrap();
+    fs::create_dir_all(root.join("a/b/c")).unwrap();
+    fs::create_dir_all(root.join("n/m")).unwrap();
+    fs::write(root.join("n/m/f"), b"hello").unwrap();
+    fs::write(root.join("empty"), b"").unwrap();
+    fs::write(root.join("\u{263A}smile"), b"x").unwrap();
+    fs::write(root.join("\u{65E5}\u{672C}"), b"x").unwrap();
+    fs::write(root.join("B"), b"x").unwrap();
+    fs::write(root.join("_x"), b"x").unwrap();
+    let big: Vec<u8> = (0..3_000_000u32)
+        .flat_map(|i| (i % 251).to_le_bytes())
+        .collect();
+    fs::write(root.join("big"), big).unwrap();
+}
+
+fn files(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut v = Vec::new();
+    fn walk(root: &Path, d: &Path, v: &mut Vec<(String, Vec<u8>)>) {
+        for e in fs::read_dir(d).unwrap() {
+            let p = e.unwrap().path();
+            let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            if p.is_dir() {
+                v.push((rel + "/", Vec::new()));
+                walk(root, &p, v);
+            } else {
+                v.push((rel, fs::read(&p).unwrap()));
+            }
+        }
+    }
+    walk(root, root, &mut v);
+    v.sort();
+    v
+}
+
+#[test]
+fn pack_verify_extract() {
+    let t = tmp("pack_verify_extract");
+    let src = t.join("src");
+    corpus(&src);
+    let z = t.join("out.zip");
+    assert!(ok(bin().args(["pack"]).arg(&src).arg("-o").arg(&z)));
+    assert!(ok(bin().args(["verify", "--deep"]).arg(&z)));
+    let x = t.join("x");
+    assert!(ok(bin().arg("extract").arg(&z).arg("-o").arg(&x)));
+    assert_eq!(files(&src), files(&x));
+
+    // rewriting a valid zip is a no-op; forced rewrite is byte-identical
+    let first = fs::read(&z).unwrap();
+    let out = bin().arg("pack").arg(&z).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("skipped"));
+    assert!(ok(bin().args(["--force", "pack"]).arg(&z)));
+    assert_eq!(first, fs::read(&z).unwrap());
+    // a different worker count gives the same bytes
+    let z1 = t.join("j1.zip");
+    assert!(ok(bin()
+        .args(["-j", "1", "pack"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&z1)));
+    assert_eq!(first, fs::read(&z1).unwrap());
+}
+
+#[test]
+fn pack_verbose_lists_entries() {
+    let t = tmp("pack_verbose_lists_entries");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("one"), b"1").unwrap();
+    fs::write(src.join("two"), b"22").unwrap();
+    let z = t.join("v.zip");
+    let out = bin()
+        .args(["pack", "-v"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&z)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("v.zip [1/2] one (1 bytes)"), "{err}");
+    assert!(err.contains("v.zip [2/2] two (2 bytes)"), "{err}");
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("packed"));
+    let q = t.join("q.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&q)));
+    assert_eq!(fs::read(&z).unwrap(), fs::read(&q).unwrap());
+    // a rerun checks the existing output instead of packing it again
+    let out = bin()
+        .args(["pack", "-v"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&z)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).starts_with("checking"));
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> usize {
+    hay.windows(needle.len()).position(|w| w == needle).unwrap()
+}
+
+#[test]
+fn verify_rejects_mutations() {
+    let t = tmp("verify_rejects");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a"), b"aaaa").unwrap();
+    fs::write(src.join("b"), b"bbbb").unwrap();
+    let z = t.join("good.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&z)));
+    let good = fs::read(&z).unwrap();
+    let cd = find(&good, b"PK\x01\x02");
+
+    type Mutation = Box<dyn Fn(&mut Vec<u8>)>;
+    let mutations: Vec<(&str, Mutation)> = vec![
+        (
+            "comment crc",
+            Box::new(|b: &mut Vec<u8>| *b.last_mut().unwrap() ^= 1),
+        ),
+        ("local time", Box::new(|b: &mut Vec<u8>| b[10] = 1)),
+        (
+            "central time",
+            Box::new(move |b: &mut Vec<u8>| b[cd + 12] = 1),
+        ),
+        // swap names "a" and "b" in all headers: wrong order, comment fixed up
+        (
+            "order",
+            Box::new(move |b: &mut Vec<u8>| {
+                let c1 = cd + 46 + 1;
+                let l1 = u32::from_le_bytes(b[c1 + 42..c1 + 46].try_into().unwrap()) as usize;
+                for (i, v) in [
+                    (30, b'b'),
+                    (l1 + 30, b'a'),
+                    (cd + 46, b'b'),
+                    (c1 + 46, b'a'),
+                ] {
+                    b[i] = v;
+                }
+                fix_comment(b);
+            }),
+        ),
+        (
+            "extra field",
+            Box::new(move |b: &mut Vec<u8>| {
+                b[cd + 30] = 4; // central extra length 4, eats into next header
+                fix_comment(b);
+            }),
+        ),
+        ("trailing data", Box::new(|b: &mut Vec<u8>| b.push(0))),
+        ("leading data", Box::new(|b: &mut Vec<u8>| b.insert(0, 0))),
+    ];
+    for (what, m) in mutations {
+        let mut b = good.clone();
+        m(&mut b);
+        let p = t.join("bad.zip");
+        fs::File::create(&p).unwrap().write_all(&b).unwrap();
+        assert!(
+            !ok(bin().arg("verify").arg(&p)),
+            "verify accepted mutation: {what}"
+        );
+    }
+}
+
+/// Recomputes the RVZSTD comment so only the intended defect remains.
+fn fix_comment(b: &mut [u8]) {
+    let cd = find(b, b"PK\x01\x02");
+    let eocd = find(b, b"PK\x05\x06");
+    let crc = crc32fast::hash(&b[cd..eocd]);
+    let s = format!("{crc:08X}");
+    let n = b.len();
+    b[n - 8..].copy_from_slice(s.as_bytes());
+}
+
+// Windows file names are case-insensitive: the second write would
+// overwrite the first
+#[cfg(unix)]
+#[test]
+fn case_collision_fails() {
+    let t = tmp("case_collision");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("ABC"), b"1").unwrap();
+    fs::write(src.join("abc"), b"2").unwrap();
+    assert!(!ok(bin()
+        .arg("pack")
+        .arg(&src)
+        .arg("-o")
+        .arg(t.join("o.zip"))));
+    assert!(!t.join("o.zip").exists());
+}
+
+#[test]
+fn unsafe_extract_refused() {
+    let t = tmp("unsafe_extract");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("zzzzz"), b"x").unwrap();
+    let z = t.join("o.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&z)));
+    let mut b = fs::read(&z).unwrap();
+    // rename "zzzzz" to "../zz" in local and central headers
+    let names: Vec<usize> = b
+        .windows(5)
+        .enumerate()
+        .filter(|(_, w)| w == b"zzzzz")
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(names.len(), 2);
+    for i in names {
+        b[i..i + 5].copy_from_slice(b"../zz");
+    }
+    fs::write(&z, &b).unwrap();
+    assert!(!ok(bin().arg("extract").arg(&z).arg("-o").arg(t.join("x"))));
+    assert!(!t.join("zz").exists());
+}
+
+#[test]
+fn pack_current_dir_names_zip_after_it() {
+    let t = tmp("pack_dot");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("f"), b"x").unwrap();
+    assert!(ok(bin().arg("pack").arg(".").current_dir(&src)));
+    assert!(t.join("src.zip").exists());
+    assert_eq!(fs::read_dir(&src).unwrap().count(), 1);
+}
+
+/// Minimal zip with deflated "Hello.txt", a stored "Dir/" and an
+/// unsorted, mixed-case order, as other tools write them.
+fn deflate_zip(path: &Path, files: &[(&str, &[u8])]) {
+    use flate2::{Compression, write::DeflateEncoder};
+    let (mut out, mut cd) = (Vec::new(), Vec::new());
+    for (name, data) in files {
+        let mut e = DeflateEncoder::new(Vec::new(), Compression::default());
+        e.write_all(data).unwrap();
+        let comp = e.finish().unwrap();
+        let (method, body): (u16, &[u8]) = if data.is_empty() {
+            (0, &[])
+        } else {
+            (8, &comp)
+        };
+        let crc = crc32fast::hash(data);
+        let off = out.len() as u32;
+        let mut common = Vec::new();
+        common.extend_from_slice(&20u16.to_le_bytes());
+        common.extend_from_slice(&0u16.to_le_bytes());
+        common.extend_from_slice(&method.to_le_bytes());
+        common.extend_from_slice(&[0x21, 0x43, 0x65, 0x57]); // some date/time
+        common.extend_from_slice(&crc.to_le_bytes());
+        common.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        common.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        common.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        common.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(b"PK\x03\x04");
+        out.extend_from_slice(&common);
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(body);
+        cd.extend_from_slice(b"PK\x01\x02");
+        cd.extend_from_slice(&20u16.to_le_bytes());
+        cd.extend_from_slice(&common);
+        cd.extend_from_slice(&[0; 6]); // comment len, disk, internal attrs
+        cd.extend_from_slice(&0x20u32.to_le_bytes()); // attrs
+        cd.extend_from_slice(&off.to_le_bytes());
+        cd.extend_from_slice(name.as_bytes());
+    }
+    let start = out.len() as u32;
+    out.extend_from_slice(&cd);
+    out.extend_from_slice(b"PK\x05\x06\0\0\0\0");
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(files.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+    out.extend_from_slice(&start.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    fs::write(path, out).unwrap();
+}
+
+#[test]
+fn recompress_deflate_zip_matches_dir_pack() {
+    let t = tmp("recompress");
+    let hello: Vec<u8> = b"Hello, world\n".repeat(1000);
+    let z = t.join("in.zip");
+    deflate_zip(
+        &z,
+        &[
+            ("sub/Hello.txt", &hello),
+            ("Dir/", b""),
+            ("sub/", b""),
+            ("a", b"x"),
+            ("Empty", b""),
+        ],
+    );
+    assert!(!ok(bin().arg("verify").arg(&z)));
+    assert!(ok(bin().arg("pack").arg(&z)));
+    assert!(ok(bin().args(["verify", "--deep"]).arg(&z)));
+
+    // the same tree packed from a directory gives the same bytes
+    let src = t.join("src");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::create_dir_all(src.join("Dir")).unwrap();
+    fs::write(src.join("sub/Hello.txt"), &hello).unwrap();
+    fs::write(src.join("a"), b"x").unwrap();
+    fs::write(src.join("Empty"), b"").unwrap();
+    let z2 = t.join("dir.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&z2)));
+    assert_eq!(fs::read(&z).unwrap(), fs::read(&z2).unwrap());
+}
+
+#[test]
+fn batch_in_place_rerun() {
+    let t = tmp("batch");
+    fs::create_dir_all(t.join("set1")).unwrap();
+    fs::write(t.join("set1/f"), b"one").unwrap();
+    deflate_zip(&t.join("set2.zip"), &[("g", b"two")]);
+    assert!(ok(bin().arg("batch").arg("--pack-dirs").arg(&t)));
+    assert!(ok(bin()
+        .arg("verify")
+        .arg(t.join("set1.zip"))
+        .arg(t.join("set2.zip"))));
+    // second run: set1/ and its own set1.zip are not a conflict, nothing to do
+    let out = bin()
+        .arg("batch")
+        .arg("--pack-dirs")
+        .arg(&t)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .matches("skipped")
+            .count(),
+        2
+    );
+    // a changed directory is packed again
+    fs::write(t.join("set1/h"), b"new").unwrap();
+    let out = bin()
+        .arg("batch")
+        .arg("--pack-dirs")
+        .arg(&t)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("packed"));
+}
+
+#[test]
+fn batch_to_outdir_rerun() {
+    let t = tmp("batch_outdir");
+    let src = t.join("src");
+    fs::create_dir_all(src.join("set1")).unwrap();
+    fs::write(src.join("set1/f"), b"one").unwrap();
+    deflate_zip(&src.join("set2.zip"), &[("g", b"two")]);
+    let out = t.join("out");
+    assert!(ok(bin()
+        .arg("batch")
+        .arg("--pack-dirs")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)));
+    assert!(ok(bin()
+        .arg("verify")
+        .arg(out.join("set1.zip"))
+        .arg(out.join("set2.zip"))));
+    // second run: both outputs are up to date, the deflate zip is not re-encoded
+    let r = bin()
+        .arg("batch")
+        .arg("--pack-dirs")
+        .arg(&src)
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .unwrap();
+    assert!(r.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&r.stdout)
+            .matches("skipped")
+            .count(),
+        2
+    );
+}
+
+fn nested_tree(src: &Path) {
+    fs::create_dir_all(src.join("a/b")).unwrap();
+    fs::create_dir_all(src.join("set")).unwrap();
+    fs::write(src.join("set/f"), b"loose").unwrap();
+    deflate_zip(&src.join("a/b/x.zip"), &[("g", b"two")]);
+    deflate_zip(&src.join("top.zip"), &[("h", b"three")]);
+}
+
+fn skipped(out: &std::process::Output) -> usize {
+    String::from_utf8_lossy(&out.stdout)
+        .matches("skipped")
+        .count()
+}
+
+#[test]
+fn batch_recursive() {
+    let t = tmp("batch_rec");
+    nested_tree(&t);
+    assert!(ok(bin().arg("batch").arg(&t)));
+    assert!(ok(bin()
+        .arg("verify")
+        .arg(t.join("a/b/x.zip"))
+        .arg(t.join("top.zip"))));
+    // directories are never packed without --pack-dirs
+    assert!(!t.join("set.zip").exists());
+    assert!(!t.join("a.zip").exists());
+    let out = bin().arg("batch").arg(&t).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(skipped(&out), 2);
+}
+
+#[test]
+fn batch_recursive_outdir() {
+    let t = tmp("batch_rec_outdir");
+    let src = t.join("src");
+    nested_tree(&src);
+    // output inside the input tree is not walked as input on a rerun
+    let out = src.join("out");
+    let run = || {
+        bin()
+            .arg("batch")
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .unwrap()
+    };
+    assert!(run().status.success());
+    assert!(ok(bin()
+        .arg("verify")
+        .arg(out.join("a/b/x.zip"))
+        .arg(out.join("top.zip"))));
+    let r = run();
+    assert!(r.status.success());
+    assert_eq!(skipped(&r), 2);
+    assert!(!out.join("out").exists());
+}
+
+#[test]
+fn batch_multiple_folders() {
+    let t = tmp("batch_multi");
+    let (a, b) = (t.join("a"), t.join("b"));
+    nested_tree(&a);
+    nested_tree(&b);
+    assert!(ok(bin().arg("batch").arg(&a).arg(&b)));
+    for d in [&a, &b] {
+        assert!(ok(bin()
+            .arg("verify")
+            .arg(d.join("a/b/x.zip"))
+            .arg(d.join("top.zip"))));
+    }
+    let out = bin().arg("batch").arg(&a).arg(&b).output().unwrap();
+    assert!(out.status.success());
+    assert_eq!(skipped(&out), 4);
+}
+
+#[test]
+fn batch_multiple_folders_outdir() {
+    let t = tmp("batch_multi_outdir");
+    let (a, b, out) = (t.join("a"), t.join("b"), t.join("out"));
+    fs::create_dir_all(a.join("set1")).unwrap();
+    fs::write(a.join("set1/f"), b"one").unwrap();
+    fs::create_dir_all(&b).unwrap();
+    deflate_zip(&b.join("set2.zip"), &[("g", b"two")]);
+    assert!(ok(bin()
+        .arg("batch")
+        .arg("--pack-dirs")
+        .arg(&a)
+        .arg(&b)
+        .arg("-o")
+        .arg(&out)));
+    assert!(ok(bin()
+        .arg("verify")
+        .arg(out.join("set1.zip"))
+        .arg(out.join("set2.zip"))));
+
+    // the same name in two folders merged into one outdir
+    let (c, d, out2) = (t.join("c"), t.join("d"), t.join("out2"));
+    fs::create_dir_all(&c).unwrap();
+    fs::create_dir_all(&d).unwrap();
+    deflate_zip(&c.join("x.zip"), &[("g", b"two")]);
+    deflate_zip(&d.join("x.zip"), &[("h", b"three")]);
+    let r = bin()
+        .arg("batch")
+        .arg(&c)
+        .arg(&d)
+        .arg("-o")
+        .arg(&out2)
+        .output()
+        .unwrap();
+    assert!(!r.status.success());
+    assert!(String::from_utf8_lossy(&r.stderr).contains("both map to"));
+    assert!(!out2.join("x.zip").exists());
+
+    // the same folder twice
+    let r = bin().arg("batch").arg(&c).arg(&c).output().unwrap();
+    assert!(!r.status.success());
+    assert!(String::from_utf8_lossy(&r.stderr).contains("both map to"));
+}
+
+/// Incompressible file just under 4 GiB: compressed size crosses 4 GiB, so
+/// the data is moved down for a zip64 extra and the zip64 EOCD is used.
+/// Slow and needs ~13 GB of disk: `cargo test --release -- --ignored`.
+#[test]
+#[ignore]
+fn zip64_compressed_size_only() {
+    let t = tmp("zip64");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    let mut f = std::io::BufWriter::new(fs::File::create(src.join("big.bin")).unwrap());
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut left = 0xFFFF_FFFEu64;
+    while left > 0 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let n = left.min(8) as usize;
+        f.write_all(&x.to_le_bytes()[..n]).unwrap();
+        left -= n as u64;
+    }
+    drop(f);
+    let z = t.join("o.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&z)));
+    assert!(ok(bin().arg("verify").arg(&z)));
+    let x = t.join("x");
+    assert!(ok(bin().arg("extract").arg(&z).arg("-o").arg(&x)));
+    assert_eq!(fs::metadata(x.join("big.bin")).unwrap().len(), 0xFFFF_FFFE);
+    fs::remove_dir_all(&t).unwrap();
+}
+
+/// Ctrl+C during an encode removes the unfinished temp file.
+#[cfg(unix)]
+#[test]
+fn sigint_removes_temp_file() {
+    let t = tmp("sigint");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    // incompressible, so level 19 takes a few seconds
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let data: Vec<u8> = (0..64 << 20)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect();
+    fs::write(src.join("big.bin"), data).unwrap();
+    let out = t.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let mut child = bin()
+        .arg("-j1")
+        .arg("pack")
+        .arg(&src)
+        .arg("-o")
+        .arg(out.join("o.zip"))
+        .spawn()
+        .unwrap();
+    let list = || fs::read_dir(&out).unwrap().count();
+    let start = std::time::Instant::now();
+    while list() == 0 {
+        assert!(start.elapsed().as_secs() < 30, "temp file never appeared");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        Command::new("kill")
+            .arg("-INT")
+            .arg(child.id().to_string())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let st = child.wait().unwrap();
+    assert_eq!(st.code(), Some(130));
+    assert_eq!(list(), 0);
+}
+
+#[cfg(unix)]
+fn mode(p: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+#[cfg(unix)]
+fn chmod(p: &Path, m: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(p, fs::Permissions::from_mode(m)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn rewrite_keeps_mode() {
+    let t = tmp("keep_mode");
+    // encode path: in-place rewrite of a deflate zip
+    let z = t.join("d.zip");
+    deflate_zip(&z, &[("f", b"data")]);
+    chmod(&z, 0o640);
+    assert!(ok(bin().arg("pack").arg(&z)));
+    assert!(ok(bin().arg("verify").arg(&z)));
+    assert_eq!(mode(&z), 0o640);
+    // copy path: valid zip over an existing file
+    let other = t.join("other.zip");
+    fs::write(&other, b"old").unwrap();
+    chmod(&other, 0o600);
+    assert!(ok(bin().arg("pack").arg(&z).arg("-o").arg(&other)));
+    assert_eq!(fs::read(&other).unwrap(), fs::read(&z).unwrap());
+    assert_eq!(mode(&other), 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn pack_rejects_symlinks() {
+    use std::os::unix::fs::symlink;
+    let t = tmp("pack_symlinks");
+    fs::write(t.join("secret"), b"secret").unwrap();
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("f"), b"x").unwrap();
+    symlink(t.join("secret"), src.join("link")).unwrap();
+    let z = t.join("o.zip");
+    assert!(!ok(bin().arg("pack").arg(&src).arg("-o").arg(&z)));
+    assert!(!z.exists());
+    // a link loop fails cleanly instead of overflowing the stack
+    fs::remove_file(src.join("link")).unwrap();
+    symlink("..", src.join("loop")).unwrap();
+    let out = bin()
+        .arg("pack")
+        .arg(&src)
+        .arg("-o")
+        .arg(&z)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!z.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn batch_rejects_symlinks() {
+    use std::os::unix::fs::symlink;
+    let t = tmp("batch_symlinks");
+    deflate_zip(&t.join("outside.zip"), &[("g", b"two")]);
+    let before = fs::read(t.join("outside.zip")).unwrap();
+    let folder = t.join("folder");
+    fs::create_dir_all(&folder).unwrap();
+    deflate_zip(&folder.join("a.zip"), &[("f", b"one")]);
+    // a link to something that is not a zip or a directory is ignored
+    symlink(t.join("outside.zip"), folder.join("readme.txt")).unwrap();
+    assert!(ok(bin().arg("batch").arg(&folder)));
+    symlink(t.join("outside.zip"), folder.join("l.zip")).unwrap();
+    assert!(!ok(bin().arg("batch").arg("--force").arg(&folder)));
+    assert!(!ok(bin().arg("batch").arg("--pack-dirs").arg(&folder)));
+    fs::remove_file(folder.join("l.zip")).unwrap();
+    symlink(&t, folder.join("d")).unwrap();
+    assert!(!ok(bin().arg("batch").arg(&folder)));
+    assert!(!ok(bin().arg("batch").arg("--pack-dirs").arg(&folder)));
+    assert!(!folder.join("d.zip").exists());
+    assert_eq!(fs::read(t.join("outside.zip")).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn extract_refuses_symlinked_parent() {
+    use std::os::unix::fs::symlink;
+    let t = tmp("extract_link_parent");
+    let src = t.join("src");
+    fs::create_dir_all(src.join("a")).unwrap();
+    fs::write(src.join("a/f"), b"x").unwrap();
+    let z = t.join("o.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&z)));
+    let victim = t.join("victim_dir");
+    fs::create_dir_all(&victim).unwrap();
+    let out = t.join("out");
+    fs::create_dir_all(&out).unwrap();
+    symlink(&victim, out.join("a")).unwrap();
+    assert!(!ok(bin().arg("extract").arg(&z).arg("-o").arg(&out)));
+    assert_eq!(fs::read_dir(&victim).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn extract_replaces_symlinked_file() {
+    use std::os::unix::fs::symlink;
+    let t = tmp("extract_link_file");
+    let src = t.join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("f"), b"new").unwrap();
+    fs::write(src.join("d/g"), b"deep").unwrap();
+    let z = t.join("o.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&z)));
+    let victim = t.join("victim");
+    fs::write(&victim, b"SECRET").unwrap();
+    let out = t.join("out");
+    fs::create_dir_all(&out).unwrap();
+    symlink(&victim, out.join("f")).unwrap();
+    // a hard link to someone else's file is replaced too, not written into
+    fs::create_dir_all(out.join("d")).unwrap();
+    fs::hard_link(&victim, out.join("d/g")).unwrap();
+    assert!(ok(bin().arg("extract").arg(&z).arg("-o").arg(&out)));
+    assert!(fs::symlink_metadata(out.join("f")).unwrap().is_file());
+    assert_eq!(fs::read(out.join("f")).unwrap(), b"new");
+    assert_eq!(fs::read(out.join("d/g")).unwrap(), b"deep");
+    assert_eq!(fs::read(&victim).unwrap(), b"SECRET");
+}
+
+/// Offset of the first central directory header.
+fn central(b: &[u8]) -> usize {
+    find(b, b"PK\x01\x02")
+}
+
+#[test]
+fn bomb_is_bounded() {
+    let t = tmp("bomb");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("f"), vec![0u8; 10 << 20]).unwrap();
+    let z = t.join("bomb.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&z)));
+    // the central directory now claims 100 bytes for 10 MiB of zstd data
+    let mut b = fs::read(&z).unwrap();
+    let c = central(&b);
+    b[c + 24..c + 28].copy_from_slice(&100u32.to_le_bytes());
+    fs::write(&z, &b).unwrap();
+    let x = t.join("x");
+    let out = bin()
+        .arg("extract")
+        .arg(&z)
+        .arg("-o")
+        .arg(&x)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("more data than its recorded size"));
+    assert_eq!(fs::read_dir(&x).unwrap().count(), 0);
+    let o = t.join("o.zip");
+    let out = bin()
+        .arg("pack")
+        .arg(&z)
+        .arg("-o")
+        .arg(&o)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("more data than its recorded size"));
+    assert!(!o.exists());
+}
+
+/// Zip with one entry whose data is `body` as is, under `method`.
+fn raw_zip(path: &Path, name: &str, method: u16, unc: u32, crc: u32, body: &[u8]) {
+    let mut common = Vec::new();
+    common.extend_from_slice(&20u16.to_le_bytes());
+    common.extend_from_slice(&0u16.to_le_bytes());
+    common.extend_from_slice(&method.to_le_bytes());
+    common.extend_from_slice(&[0; 4]);
+    common.extend_from_slice(&crc.to_le_bytes());
+    common.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    common.extend_from_slice(&unc.to_le_bytes());
+    common.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    common.extend_from_slice(&0u16.to_le_bytes());
+    let mut out = b"PK\x03\x04".to_vec();
+    out.extend_from_slice(&common);
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(body);
+    let start = out.len() as u32;
+    let mut cd = b"PK\x01\x02".to_vec();
+    cd.extend_from_slice(&20u16.to_le_bytes());
+    cd.extend_from_slice(&common);
+    cd.extend_from_slice(&[0; 14]); // comment len, disk, attrs, offset 0
+    cd.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(&cd);
+    out.extend_from_slice(b"PK\x05\x06\0\0\0\0\x01\0\x01\0");
+    out.extend_from_slice(&(cd.len() as u32).to_le_bytes());
+    out.extend_from_slice(&start.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    fs::write(path, out).unwrap();
+}
+
+#[test]
+fn huge_zstd_window_refused() {
+    let t = tmp("huge_window");
+    // frame header with windowLog 30 (1 GiB), then one raw last block "x"
+    let frame = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 20 << 3, 0x09, 0, 0, b'x'];
+    let z = t.join("w.zip");
+    raw_zip(&z, "f", 93, 1, crc32fast::hash(b"x"), &frame);
+    let x = t.join("x");
+    let out = bin()
+        .arg("extract")
+        .arg(&z)
+        .arg("-o")
+        .arg(&x)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("zstd:"));
+    assert_eq!(fs::read_dir(&x).unwrap().count(), 0);
+    // the same frame with windowLog 23 is fine
+    let frame = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 13 << 3, 0x09, 0, 0, b'x'];
+    raw_zip(&z, "f", 93, 1, crc32fast::hash(b"x"), &frame);
+    assert!(ok(bin().arg("extract").arg(&z).arg("-o").arg(&x)));
+    assert_eq!(fs::read(x.join("f")).unwrap(), b"x");
+}
+
+#[test]
+fn extract_refuses_file_dir_clash() {
+    let t = tmp("file_dir_clash");
+    let cases: [&[(&str, &[u8])]; 2] = [&[("e", b"x"), ("e/", b"")], &[("e", b"x"), ("e/x", b"y")]];
+    for (i, files) in cases.iter().enumerate() {
+        let z = t.join(format!("{i}.zip"));
+        deflate_zip(&z, files);
+        let x = t.join(format!("x{i}"));
+        let out = bin()
+            .arg("extract")
+            .arg(&z)
+            .arg("-o")
+            .arg(&x)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("both a file and a directory"));
+        assert!(!x.exists());
+    }
+}
+
+#[test]
+fn pack_refuses_output_inside_input() {
+    let t = tmp("pack_self");
+    let src = t.join("src");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::write(src.join("f"), b"x").unwrap();
+    for o in ["self.zip", "sub/self.zip"] {
+        let out = bin()
+            .arg("pack")
+            .arg(&src)
+            .arg("-o")
+            .arg(src.join(o))
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("inside the packed directory"));
+    }
+    assert_eq!(files(&src).len(), 2); // f and sub/, nothing new
+    // batch --pack-dirs with the output folder among the packed ones
+    let folder = t.join("folder");
+    fs::create_dir_all(folder.join("X")).unwrap();
+    fs::write(folder.join("X/f"), b"x").unwrap();
+    assert!(!ok(bin()
+        .args(["batch", "--pack-dirs"])
+        .arg(&folder)
+        .arg("-o")
+        .arg(folder.join("X"))));
+    assert!(!folder.join("X/X.zip").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn fifo_named_zip_does_not_hang() {
+    let t = tmp("fifo_zip");
+    let folder = t.join("folder");
+    fs::create_dir_all(&folder).unwrap();
+    let fifo = folder.join("evil.zip");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // each would block forever in open(2) if the FIFO were opened plainly
+    assert!(ok(bin().arg("batch").arg(&folder)));
+    assert!(ok(bin().args(["batch", "--pack-dirs"]).arg(&folder)));
+    assert!(!ok(bin().arg("verify").arg(&fifo)));
+    assert!(!ok(bin().arg("pack").arg(&fifo)));
+    assert!(!ok(bin()
+        .arg("extract")
+        .arg(&fifo)
+        .arg("-o")
+        .arg(t.join("x"))));
+}
+
+/// Two dirs and a deflate zip for the multi-input pack tests.
+fn pack_inputs(t: &Path) -> [PathBuf; 3] {
+    let (a, b, z) = (t.join("a"), t.join("b"), t.join("z.zip"));
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    fs::write(a.join("f"), b"one").unwrap();
+    fs::write(b.join("g"), b"two".repeat(1000)).unwrap();
+    deflate_zip(&z, &[("h", b"three")]);
+    [a, b, z]
+}
+
+#[test]
+fn pack_multiple() {
+    let t = tmp("pack_multiple");
+    let [a, b, z] = pack_inputs(&t);
+    assert!(ok(bin().arg("pack").arg(&a).arg(&b).arg(&z)));
+    for out in [t.join("a.zip"), t.join("b.zip"), z] {
+        assert!(ok(bin().args(["verify", "--deep"]).arg(&out)), "{out:?}");
+    }
+}
+
+#[test]
+fn pack_multiple_outdir() {
+    let t = tmp("pack_multiple_outdir");
+    let [a, b, z] = pack_inputs(&t);
+    let before = fs::read(&z).unwrap();
+    let out = t.join("out");
+    assert!(ok(bin()
+        .arg("pack")
+        .arg(&a)
+        .arg(&b)
+        .arg(&z)
+        .arg("-o")
+        .arg(&out)));
+    for name in ["a.zip", "b.zip", "z.zip"] {
+        assert!(
+            ok(bin().args(["verify", "--deep"]).arg(out.join(name))),
+            "{name}"
+        );
+    }
+    assert_eq!(fs::read(&z).unwrap(), before);
+    assert!(!t.join("a.zip").exists() && !t.join("b.zip").exists());
+}
+
+#[test]
+fn pack_multiple_collisions() {
+    let t = tmp("pack_multiple_collisions");
+    let c = t.join("c");
+    fs::create_dir_all(c.join("x")).unwrap();
+    fs::create_dir_all(t.join("d/x")).unwrap();
+    fs::write(c.join("x/f"), b"one").unwrap();
+    fs::write(t.join("d/x/g"), b"two").unwrap();
+    let fails = |cmd: &mut Command| {
+        let r = cmd.output().unwrap();
+        assert!(!r.status.success());
+        assert!(String::from_utf8_lossy(&r.stderr).contains("both map to"));
+    };
+
+    // the same dir twice
+    fails(bin().arg("pack").arg(&c).arg(&c));
+    assert!(!t.join("c.zip").exists());
+
+    // a dir and its default output, from the current directory
+    deflate_zip(&t.join("c.zip"), &[("h", b"three")]);
+    fails(bin().args(["pack", "c", "c.zip"]).current_dir(&t));
+    fs::remove_file(t.join("c.zip")).unwrap();
+
+    // two dirs with the same name into one outdir
+    let out = t.join("out");
+    fails(
+        bin()
+            .arg("pack")
+            .arg(c.join("x"))
+            .arg(t.join("d/x"))
+            .arg("-o")
+            .arg(&out),
+    );
+    assert!(!out.join("x.zip").exists());
+}

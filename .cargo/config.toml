@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[env]
+# libzstd (C) must be built against musl headers for the static target
+CC_x86_64_unknown_linux_musl = "musl-gcc"
+CC_aarch64_unknown_linux_musl = "musl-gcc"

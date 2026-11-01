@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "rvsz"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Writes, verifies and extracts zips byte-identical to RomVault RVZSTD structured zips"
+license = "MIT OR Apache-2.0"
+authors = ["Timothy Redaelli <timothy.redaelli@gmail.com>"]
+repository = "https://github.com/drizzt/rvsz"
+readme = "README.md"
+keywords = ["romvault", "zip", "zstd", "rvzstd"]
+categories = ["command-line-utilities", "compression"]
+# Repository tooling (CI, local build config, the C# oracle) is not needed to
+# build or test the crate.
+exclude = ["/.cargo", "/.github", "/.gitignore", "/deny.toml", "/tools"]
+
+# Matches the asset names and layout made by .github/workflows/release.yml.
+# pkg-fmt is left unset so binstall tries both the .tar.gz and .zip archives.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+crc32fast = "1.5.3"
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+zstd-sys = { version = "=2.0.9", default-features = false, features = ["zstdmt"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"
+signal-hook = { version = "0.4.6", default-features = false, features = ["iterator"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemInformation"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

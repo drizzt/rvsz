@@ -1,0 +1,926 @@
+// SPDX-FileCopyrightText: 2026 Timothy Redaelli <timothy.redaelli@gmail.com>
+//
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+mod cp437;
+mod entries;
+mod progress;
+mod rvzstd;
+mod sort;
+mod sys;
+mod validate;
+mod zipread;
+mod zipwrite;
+
+use clap::{Parser, Subcommand};
+use entries::{Entry, Source};
+use progress::{Bar, Progress};
+use rvzstd::Encoder;
+use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
+use zipread::{Archive, pump};
+use zipwrite::ZipWriter;
+
+#[derive(Parser)]
+#[command(version, about = "Write and check RomVault RVZSTD zip files")]
+struct Cli {
+    /// Total zstd worker threads (default: number of CPUs)
+    #[arg(short = 'j', long, global = true)]
+    jobs: Option<usize>,
+    /// Memory budget in MiB for concurrent encoders and decoders (default: 3/4 of MemAvailable)
+    #[arg(long, global = true)]
+    max_mem: Option<u64>,
+    /// Rewrite even if the target is already a valid RVZSTD zip
+    #[arg(long, global = true)]
+    force: bool,
+    /// Print each entry as it is packed (on stderr)
+    #[arg(short, long, global = true)]
+    verbose: bool,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Pack a directory into a zip, or rewrite a zip (in place by default).
+    /// With several inputs, -o is a directory for all the outputs
+    Pack {
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Rewrite every *.zip under each folder, recursively
+    Batch {
+        #[arg(required = true)]
+        folders: Vec<PathBuf>,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Instead pack each subdirectory into <name>.zip and rewrite only
+        /// the *.zip files directly in the folder
+        #[arg(long)]
+        pack_dirs: bool,
+    },
+    /// Check zips; exit status is non-zero if any is not valid RVZSTD
+    Verify {
+        /// Also decompress, check CRCs and re-encode to compare the data
+        #[arg(long)]
+        deep: bool,
+        #[arg(required = true)]
+        zips: Vec<PathBuf>,
+    },
+    /// Extract a zip
+    Extract {
+        zip: PathBuf,
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+}
+
+/// Peak memory of one level 19 encoder with `workers` threads. Measured
+/// peak RSS of `pack` on a 234 MB input: 264, 394, 623 MiB at 1, 2, 4 workers
+/// (about 135 MiB shared plus 130 MiB per worker), plus some margin.
+fn encoder_mem_mib(workers: usize) -> u64 {
+    150 + 130 * workers as u64
+}
+
+/// Peak memory of one zstd decoder: a window of up to 128 MiB (windowLogMax
+/// 27, set in rvzstd.rs) plus block and I/O buffers. A frame this tool
+/// writes uses 8 MiB, but a hostile one may ask for the limit.
+fn decoder_mem_mib() -> u64 {
+    140
+}
+
+fn mem_available_mib() -> u64 {
+    sys::mem_available_mib().unwrap_or(1024)
+}
+
+enum Outcome {
+    Written,
+    Skipped,
+}
+
+/// Where data for each entry comes from.
+enum Input {
+    Dir,
+    Zip(Archive),
+}
+
+fn source_reader<'a>(input: &'a Input, e: &Entry) -> io::Result<Box<dyn Read + 'a>> {
+    match (&e.src, input) {
+        // `pump` reads in 1 MiB chunks, so a BufReader would add nothing
+        (Source::File(p), _) => Ok(Box::new(open_source(p, e.size)?)),
+        (Source::Zip(i, _), Input::Zip(a)) => a.open_entry(*i),
+        _ => unreachable!(),
+    }
+}
+
+/// Opens a file found by the directory walk. If it was swapped for a
+/// symlink, a FIFO or another file since, the open or the checks fail.
+/// A parent directory swapped for a symlink is still
+/// followed; covering that would need an openat walk like `extract` uses.
+fn open_source(p: &Path, size: u64) -> io::Result<File> {
+    let f =
+        sys::open_source_file(p).map_err(|e| io::Error::other(format!("{}: {e}", p.display())))?;
+    let m = f.metadata()?;
+    if !m.is_file() || m.len() != size {
+        return Err(io::Error::other(format!(
+            "{}: changed while packing",
+            p.display()
+        )));
+    }
+    Ok(f)
+}
+
+fn write_zip(
+    input: Input,
+    list: &[Entry],
+    dest: &Path,
+    enc: &mut Encoder,
+    verbose: bool,
+    bar: &Bar,
+) -> io::Result<()> {
+    let mut w = ZipWriter::create(dest)?;
+    // batch runs several zips at once: the prefix tells their lines apart
+    let tag = dest.file_name().unwrap_or_default().to_string_lossy();
+    let total: u64 = list.iter().map(|e| e.size).sum();
+    bar.set_total(total);
+    enc.set_meter(bar.counter());
+    if verbose {
+        bar.line(
+            true,
+            &format!(
+                "packing {}: {} entries, {}",
+                dest.display(),
+                list.len(),
+                human(total)
+            ),
+        );
+    }
+    for (i, e) in list.iter().enumerate() {
+        if verbose {
+            bar.line(
+                true,
+                &format!(
+                    "{tag} [{}/{}] {} ({})",
+                    i + 1,
+                    list.len(),
+                    e.name,
+                    human(e.size)
+                ),
+            );
+        }
+        let r = w.add(&e.name, e.size, |sink| {
+            let src = source_reader(&input, e)?;
+            let (n, crc) = pump(src, e.size, |b| enc.write(b, sink))
+                .map_err(|err| io::Error::other(format!("{}: {err}", e.name)))?;
+            if let Source::Zip(_, want) = e.src
+                && crc != want
+            {
+                return Err(io::Error::other(format!(
+                    "{}: CRC error in source zip",
+                    e.name
+                )));
+            }
+            if n == e.size {
+                enc.finish(sink)?;
+            }
+            Ok((n, crc))
+        });
+        if let Err(err) = r {
+            enc.reset();
+            return Err(err);
+        }
+    }
+    // an in-place rewrite replaces the source zip: Windows refuses to
+    // rename over a file that is still open
+    drop(input);
+    w.finish()
+}
+
+/// True if `zip` is valid RVZSTD and holds exactly `list`: same names,
+/// sizes and CRCs (read from the files, or taken from the source zip).
+fn zip_matches(zip: &Path, input: &Input, list: &[Entry]) -> io::Result<bool> {
+    let Ok(a) = Archive::open(zip) else {
+        return Ok(false);
+    };
+    if validate::check(&a, None).is_err() || a.entries.len() != list.len() {
+        return Ok(false);
+    }
+    for (z, e) in a.entries.iter().zip(list) {
+        if z.name != e.name || z.unc != e.size {
+            return Ok(false);
+        }
+        let crc = match e.src {
+            Source::File(_) => pump(source_reader(input, e)?, e.size, |_| Ok(()))?.1,
+            Source::Zip(_, crc) => crc,
+            Source::Dir => continue,
+        };
+        if crc != z.crc {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn human(n: u64) -> String {
+    if n < 1024 * 1024 {
+        format!("{n} bytes")
+    } else {
+        format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn pack(
+    input: &Path,
+    dest: &Path,
+    force: bool,
+    verbose: bool,
+    enc: &mut Encoder,
+    bar: &Bar,
+) -> io::Result<Outcome> {
+    let (src, list) = if input.is_dir() {
+        // the output would be packed into itself by the next run
+        let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
+        if let (Ok(d), Ok(i)) = (
+            fs::canonicalize(parent.unwrap_or(Path::new("."))),
+            fs::canonicalize(input),
+        ) && d.starts_with(&i)
+        {
+            return Err(io::Error::other("output is inside the packed directory"));
+        }
+        (Input::Dir, entries::from_dir(input)?)
+    } else {
+        let a = Archive::open(input)?;
+        if !force && validate::check(&a, None).is_ok() {
+            if !same_file(input, dest) {
+                copy_atomic(input, dest)?;
+                return Ok(Outcome::Written);
+            }
+            return Ok(Outcome::Skipped);
+        }
+        let list = entries::from_zip(&a)?;
+        (Input::Zip(a), list)
+    };
+    // an output from an earlier run (e.g. `batch -o`) needs no new encode
+    if !force && dest.exists() {
+        if verbose {
+            // reads every source file to compare CRCs
+            bar.line(true, &format!("checking {}", dest.display()));
+        }
+        if zip_matches(dest, &src, &list)? {
+            return Ok(Outcome::Skipped);
+        }
+    }
+    write_zip(src, &list, dest, enc, verbose, bar)?;
+    Ok(Outcome::Written)
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+fn copy_atomic(src: &Path, dest: &Path) -> io::Result<()> {
+    let (mut f, tmp) = zipwrite::create_temp(dest)?;
+    let r = File::open(src)
+        .and_then(|mut s| io::copy(&mut s, &mut f))
+        .and_then(|_| f.sync_all())
+        .and_then(|_| fs::rename(&tmp, dest));
+    if r.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    zipwrite::untrack_temp(&tmp);
+    r
+}
+
+fn default_pack_output(input: &Path) -> PathBuf {
+    if input.is_dir() {
+        // "." and ".." have no name of their own: use the real directory's,
+        // else "." would give "..zip" inside the directory being packed
+        let dir = match input.file_name() {
+            Some(_) => input.to_path_buf(),
+            None => fs::canonicalize(input).unwrap_or_else(|_| input.to_path_buf()),
+        };
+        // collecting components drops a trailing '/'
+        let mut s = dir.components().collect::<PathBuf>().into_os_string();
+        s.push(".zip");
+        PathBuf::from(s)
+    } else {
+        input.to_path_buf()
+    }
+}
+
+fn batch_jobs(folder: &Path, outdir: &Path) -> io::Result<Vec<(PathBuf, PathBuf)>> {
+    let mut dirs = std::collections::BTreeMap::new();
+    let mut zips = Vec::new();
+    for d in fs::read_dir(folder)? {
+        let d = d?;
+        let p = d.path();
+        // kept as OsString: a lossy name would point the job at another file
+        let fname = d.file_name();
+        let b = fname.as_encoded_bytes();
+        if b.starts_with(b".") {
+            continue;
+        }
+        let ft = d.file_type()?;
+        // a link here would be packed or rewritten, reaching outside the folder
+        if ft.is_symlink() && (p.is_dir() || is_zip_name(b)) {
+            return Err(entries::symlink_error(&p));
+        }
+        if ft.is_dir() {
+            let mut target = fname;
+            target.push(".zip");
+            dirs.insert(target, p);
+        } else if is_zip_name(b) && ft.is_file() {
+            zips.push((fname, p));
+        }
+    }
+    let mut jobs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for (target, p) in zips {
+        if dirs.contains_key(&target) {
+            // X.zip next to X/ is X's own output from an earlier run: the
+            // directory job rewrites it (or skips it if it is up to date).
+            if same_file(&p, &outdir.join(&target)) {
+                continue;
+            }
+            return Err(io::Error::other(format!(
+                "both a directory and a zip map to {}",
+                target.to_string_lossy()
+            )));
+        }
+        jobs.push((p, outdir.join(target)));
+    }
+    jobs.extend(dirs.into_iter().map(|(target, p)| (p, outdir.join(target))));
+    jobs.sort();
+    Ok(jobs)
+}
+
+/// Error if two jobs write the same output: several folders merged into one
+/// `-o` directory, the same folder given twice, or one folder inside another.
+/// Every output parent exists by now (created while collecting the jobs).
+fn check_dest_collisions(jobs: &[(PathBuf, PathBuf)]) -> io::Result<()> {
+    let mut seen = std::collections::HashMap::new();
+    for (src, dest) in jobs {
+        // a bare file name has an empty parent, which canonicalize rejects
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let key = (
+            fs::canonicalize(parent)?,
+            dest.file_name().map(OsStr::to_owned),
+        );
+        if let Some(prev) = seen.insert(key, src) {
+            return Err(io::Error::other(format!(
+                "{} and {} both map to {}",
+                prev.display(),
+                src.display(),
+                dest.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_zip_name(b: &[u8]) -> bool {
+    b.len() >= 4 && b[b.len() - 4..].eq_ignore_ascii_case(b".zip")
+}
+
+/// Every *.zip under `dir`, at any depth, with its output path under `outdir`
+/// (the same relative path). `root_out` is the top output directory, skipped
+/// if found inside the input tree. A symlinked directory or zip is an error:
+/// following it would read or rewrite files outside the tree.
+fn zip_jobs(
+    dir: &Path,
+    outdir: &Path,
+    root_out: &Path,
+    jobs: &mut Vec<(PathBuf, PathBuf)>,
+) -> io::Result<()> {
+    for d in fs::read_dir(dir)? {
+        let d = d?;
+        let p = d.path();
+        let fname = d.file_name();
+        let b = fname.as_encoded_bytes();
+        if b.starts_with(b".") {
+            continue;
+        }
+        let ft = d.file_type()?;
+        if ft.is_symlink() && (p.is_dir() || is_zip_name(b)) {
+            return Err(entries::symlink_error(&p));
+        } else if ft.is_dir() {
+            // `batch src -o src/out`: do not take earlier outputs as inputs
+            if !same_file(&p, root_out) {
+                zip_jobs(&p, &outdir.join(&fname), root_out, jobs)?;
+            }
+        } else if is_zip_name(b) && ft.is_file() {
+            fs::create_dir_all(outdir)?;
+            jobs.push((p, outdir.join(fname)));
+        }
+    }
+    Ok(())
+}
+
+/// Most workers (at least 1, at most `total`) whose encoder fits in `mem_mib`.
+fn fit_workers(total: usize, mem_mib: u64) -> usize {
+    let fit =
+        mem_mib.saturating_sub(encoder_mem_mib(0)) / (encoder_mem_mib(1) - encoder_mem_mib(0));
+    fit.clamp(1, total.max(1) as u64) as usize
+}
+
+/// One batch job and its size, the estimate of its encode time: the zip's
+/// file size, or the total size of the files of a packed directory.
+struct Job {
+    src: PathBuf,
+    dest: PathBuf,
+    size: u64,
+}
+
+fn tree_size(p: &Path) -> u64 {
+    let Ok(m) = fs::symlink_metadata(p) else {
+        return 0;
+    };
+    if !m.is_dir() {
+        return m.len();
+    }
+    fs::read_dir(p).map_or(0, |rd| rd.flatten().map(|d| tree_size(&d.path())).sum())
+}
+
+/// Hands out jobs, largest first, with their worker count. zstd cannot
+/// change the worker count inside a frame, so the count is fixed when a job
+/// starts: its share of the free workers is its share of the work not yet
+/// started (a large file next to small ones gets many, equal files get one
+/// each, and the last jobs take the workers that earlier ones gave back).
+/// Running encoders and decoders stay within `budget` MiB.
+struct Sched {
+    jobs: Vec<Job>,
+    free: usize,
+    left: u64,
+    used: u64,
+    running: usize,
+    budget: u64,
+}
+
+impl Sched {
+    fn job_mem(w: usize, src: &Path) -> u64 {
+        encoder_mem_mib(w) + if src.is_dir() { 0 } else { decoder_mem_mib() }
+    }
+
+    /// Next job and its workers, or None if the queue is empty. Some(None):
+    /// no memory or worker free yet, wait for a running job to end.
+    fn take(&mut self) -> Option<Option<(Job, usize)>> {
+        let job = self.jobs.last()?;
+        let dec = Self::job_mem(0, &job.src) - encoder_mem_mib(0);
+        let avail = if self.running == 0 {
+            // alone: run even if the budget is too small, as `pack` does
+            fit_workers(self.free, self.budget.saturating_sub(dec))
+        } else {
+            let mem = self
+                .budget
+                .saturating_sub(self.used + encoder_mem_mib(0) + dec);
+            self.free
+                .min((mem / (encoder_mem_mib(1) - encoder_mem_mib(0))) as usize)
+        };
+        if avail == 0 {
+            return Some(None);
+        }
+        let share = (job.size as u128 * self.free as u128).div_ceil(self.left.max(1) as u128);
+        let w = (share.min(avail as u128) as usize).max(1);
+        let job = self.jobs.pop()?;
+        self.free -= w;
+        self.left -= job.size;
+        self.used += Self::job_mem(w, &job.src);
+        self.running += 1;
+        Some(Some((job, w)))
+    }
+
+    fn release(&mut self, w: usize, src: &Path) {
+        self.free += w;
+        self.used -= Self::job_mem(w, src);
+        self.running -= 1;
+    }
+}
+
+fn run_jobs(
+    mut jobs: Vec<Job>,
+    total: usize,
+    budget: u64,
+    force: bool,
+    verbose: bool,
+    batch: bool,
+) -> bool {
+    jobs.sort_by_key(|j| j.size);
+    let threads = total.clamp(1, jobs.len().max(1));
+    let left = jobs.iter().map(|j| j.size).sum();
+    let count = jobs.len();
+    let sched = Mutex::new(Sched {
+        left,
+        jobs,
+        free: total.max(1),
+        used: 0,
+        running: 0,
+        budget,
+    });
+    let freed = Condvar::new();
+    let failed = AtomicBool::new(false);
+    Progress::run(count, left, |p| {
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    loop {
+                        let mut st = sched.lock().unwrap();
+                        let (job, w) = loop {
+                            match st.take() {
+                                None => return,
+                                Some(Some(t)) => break t,
+                                Some(None) => st = freed.wait(st).unwrap(),
+                            }
+                        };
+                        drop(st);
+                        // gives back the workers even if `pack` panics, else the
+                        // other threads would wait on `freed` forever
+                        struct Release<'a>(&'a Mutex<Sched>, &'a Condvar, usize, &'a Path);
+                        impl Drop for Release<'_> {
+                            fn drop(&mut self) {
+                                let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                                st.release(self.2, self.3);
+                                self.1.notify_all();
+                            }
+                        }
+                        let _release = Release(&sched, &freed, w, &job.src);
+                        let name = job.dest.file_name().unwrap_or_default().to_string_lossy();
+                        let bar = p.start(&name, job.size);
+                        if batch && !p.on() {
+                            // a big zip at level 19 can take an hour: show it started
+                            eprintln!("packing {} ({w} workers)", job.dest.display());
+                        }
+                        let r = Encoder::new(w as u32).and_then(|mut enc| {
+                            pack(&job.src, &job.dest, force, verbose, &mut enc, &bar)
+                        });
+                        drop(bar);
+                        match r {
+                            Ok(Outcome::Written) => {
+                                p.line(false, &format!("packed  {}", job.dest.display()))
+                            }
+                            Ok(Outcome::Skipped) => p.line(
+                                false,
+                                &format!("skipped {} (already valid)", job.dest.display()),
+                            ),
+                            Err(e) => {
+                                p.line(true, &format!("error: {}: {e}", job.src.display()));
+                                failed.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+        })
+    });
+    !failed.load(Ordering::Relaxed)
+}
+
+fn safe_path(name: &str) -> Option<PathBuf> {
+    let p = Path::new(name);
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::Normal(x) => out.push(x),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
+/// Opens or creates every directory of `rel` below `root` and, for a file
+/// entry, creates the file. Each step is relative to the directory opened
+/// before it, so a symlink swapped in meanwhile is never followed (on Unix;
+/// see `sys::Dir` for Windows). For a
+/// file, also returns its parent (None for `root`) and its name in there.
+fn create_at<'a>(
+    root: &sys::Dir,
+    rel: &'a Path,
+    is_dir: bool,
+) -> io::Result<Option<(Option<sys::Dir>, &'a OsStr, File)>> {
+    let parts: Vec<&OsStr> = rel.iter().collect();
+    let (last, parents) = parts.split_last().expect("safe_path is not empty");
+    let mut dir: Option<sys::Dir> = None;
+    for p in parents {
+        dir = Some(sys::open_dir_at(dir.as_ref().unwrap_or(root), p)?);
+    }
+    let parent = dir.as_ref().unwrap_or(root);
+    if is_dir {
+        sys::open_dir_at(parent, last)?;
+        return Ok(None);
+    }
+    let f = sys::create_file_at(parent, last)?;
+    Ok(Some((dir, last, f)))
+}
+
+/// Output path of every entry, checked before anything is written: each
+/// must be safe, and no file may sit where another entry needs a directory
+/// (`e` next to `e/` or `e/x`), which would fail halfway through.
+fn extract_paths(a: &Archive) -> io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::with_capacity(a.entries.len());
+    let mut files = HashSet::new();
+    let mut dirs = HashSet::new();
+    for e in &a.entries {
+        let name = e.name.replace('\\', "/");
+        let Some(rel) = safe_path(&name) else {
+            return Err(io::Error::other(format!(
+                "unsafe path in zip: {:?}",
+                e.name
+            )));
+        };
+        if e.is_dir() {
+            dirs.insert(rel.clone());
+        } else {
+            files.insert(rel.clone());
+        }
+        dirs.extend(rel.ancestors().skip(1).map(Path::to_path_buf));
+        paths.push(rel);
+    }
+    if let Some(p) = files.iter().find(|p| dirs.contains(*p)) {
+        return Err(io::Error::other(format!(
+            "{}: both a file and a directory in zip",
+            p.display()
+        )));
+    }
+    Ok(paths)
+}
+
+fn extract(zip: &Path, outdir: &Path, bar: &Bar) -> io::Result<()> {
+    let a = Archive::open(zip)?;
+    let paths = extract_paths(&a)?;
+    bar.set_total(a.entries.iter().map(|e| e.unc).sum());
+    fs::create_dir_all(outdir)?;
+    let root = sys::open_root(outdir)?;
+    for (i, (e, rel)) in a.entries.iter().zip(&paths).enumerate() {
+        let out = create_at(&root, rel, e.is_dir())
+            .map_err(|err| io::Error::other(format!("{}: {err}", e.name)))?;
+        let Some((dir, last, out)) = out else {
+            continue;
+        };
+        let r = (|| {
+            let mut f = io::BufWriter::with_capacity(1 << 20, out);
+            let (n, crc) = pump(a.open_entry(i)?, e.unc, |b| {
+                bar.add(b.len());
+                io::Write::write_all(&mut f, b)
+            })?;
+            io::Write::flush(&mut f)?;
+            if n != e.unc || crc != e.crc {
+                return Err(io::Error::other("size or CRC mismatch"));
+            }
+            Ok(())
+        })();
+        if let Err(err) = r {
+            // by name in the directory opened before, never through a path
+            let _ = sys::unlink_at(dir.as_ref().unwrap_or(&root), last);
+            return Err(io::Error::other(format!("{}: {err}", e.name)));
+        }
+    }
+    Ok(())
+}
+
+fn main() {
+    let cli = Cli::parse();
+    sys::cleanup_on_signal();
+    // panic = "abort" skips Drop, which would remove the temp file; the hook
+    // still runs before the abort
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        zipwrite::try_remove_temp_files();
+    }));
+    let total = cli
+        .jobs
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let mem = cli.max_mem.unwrap_or_else(|| mem_available_mib() * 3 / 4);
+    let ok = match cli.cmd {
+        Cmd::Pack { mut inputs, output } if inputs.len() == 1 => {
+            let input = inputs.remove(0);
+            let dest = output.unwrap_or_else(|| default_pack_output(&input));
+            // alone, the job gets every worker that fits whatever its size
+            let job = Job {
+                size: 1,
+                src: input,
+                dest,
+            };
+            run_jobs(vec![job], total, mem, cli.force, cli.verbose, false)
+        }
+        Cmd::Pack { inputs, output } => {
+            let r = (|| {
+                if let Some(out) = &output {
+                    fs::create_dir_all(out)?;
+                }
+                let jobs: Vec<_> = inputs
+                    .into_iter()
+                    .map(|src| {
+                        let def = default_pack_output(&src);
+                        let dest = match &output {
+                            Some(out) => out.join(def.file_name().unwrap_or_default()),
+                            None => def,
+                        };
+                        (src, dest)
+                    })
+                    .collect();
+                check_dest_collisions(&jobs)?;
+                Ok::<_, io::Error>(jobs)
+            })();
+            match r {
+                Ok(jobs) => {
+                    let jobs = jobs
+                        .into_iter()
+                        .map(|(src, dest)| Job {
+                            size: tree_size(&src),
+                            src,
+                            dest,
+                        })
+                        .collect();
+                    run_jobs(jobs, total, mem, cli.force, cli.verbose, true)
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        Cmd::Batch {
+            folders,
+            output,
+            pack_dirs,
+        } => {
+            let r = (|| {
+                let mut jobs = Vec::new();
+                for folder in &folders {
+                    let outdir = output.clone().unwrap_or_else(|| folder.clone());
+                    fs::create_dir_all(&outdir)?;
+                    if pack_dirs {
+                        jobs.extend(batch_jobs(folder, &outdir)?);
+                    } else {
+                        zip_jobs(folder, &outdir, &outdir, &mut jobs)?;
+                    }
+                }
+                check_dest_collisions(&jobs)?;
+                jobs.sort();
+                Ok::<_, io::Error>(jobs)
+            })();
+            match r {
+                Ok(jobs) => {
+                    let jobs = jobs
+                        .into_iter()
+                        .map(|(src, dest)| Job {
+                            size: tree_size(&src),
+                            src,
+                            dest,
+                        })
+                        .collect();
+                    run_jobs(jobs, total, mem, cli.force, cli.verbose, true)
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        Cmd::Verify { deep, zips } => {
+            let workers = fit_workers(total, mem.saturating_sub(decoder_mem_mib())) as u32;
+            let mut enc = if deep {
+                Some(Encoder::new(workers).expect("zstd encoder"))
+            } else {
+                None
+            };
+            let sizes: Vec<u64> = zips
+                .iter()
+                .map(|z| fs::metadata(z).map_or(0, |m| m.len()))
+                .collect();
+            Progress::run(zips.len(), sizes.iter().sum(), |p| {
+                let mut ok = true;
+                for (z, size) in zips.iter().zip(sizes) {
+                    let bar = p.start(&z.file_name().unwrap_or_default().to_string_lossy(), size);
+                    let r = Archive::open(z)
+                        .map_err(|e| e.to_string())
+                        .and_then(|a| validate::check(&a, enc.as_mut().map(|e| (e, &bar))));
+                    drop(bar);
+                    match r {
+                        Ok(()) => p.line(false, &format!("ok      {}", z.display())),
+                        Err(e) => {
+                            p.line(false, &format!("invalid {}: {e}", z.display()));
+                            ok = false;
+                        }
+                    }
+                }
+                ok
+            })
+        }
+        Cmd::Extract { zip, output } => {
+            let out = output.unwrap_or_else(|| PathBuf::from("."));
+            let size = fs::metadata(&zip).map_or(0, |m| m.len());
+            Progress::run(1, size, |p| {
+                let bar = p.start(&zip.file_name().unwrap_or_default().to_string_lossy(), size);
+                let r = extract(&zip, &out, &bar);
+                drop(bar);
+                match r {
+                    Ok(()) => true,
+                    Err(e) => {
+                        p.line(true, &format!("error: {}: {e}", zip.display()));
+                        false
+                    }
+                }
+            })
+        }
+    };
+    std::process::exit(if ok { 0 } else { 1 });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sched(sizes: &[u64], free: usize, budget: u64) -> Sched {
+        let mut jobs: Vec<Job> = sizes
+            .iter()
+            .map(|&size| Job {
+                src: PathBuf::from("a.zip"),
+                dest: PathBuf::from("b.zip"),
+                size,
+            })
+            .collect();
+        jobs.sort_by_key(|j| j.size);
+        Sched {
+            left: sizes.iter().sum(),
+            jobs,
+            free,
+            used: 0,
+            running: 0,
+            budget,
+        }
+    }
+
+    fn workers(s: &mut Sched) -> Option<usize> {
+        s.take().unwrap().map(|(_, w)| w)
+    }
+
+    #[test]
+    fn sched_shares_workers_by_size() {
+        // equal jobs: one worker each
+        let mut s = sched(&[100; 30], 24, u64::MAX);
+        for _ in 0..24 {
+            assert_eq!(workers(&mut s), Some(1));
+        }
+        assert_eq!(workers(&mut s), None);
+        // a large job next to small ones gets its share first
+        let mut s = sched(&[4000, 50, 50, 50, 50, 50], 24, u64::MAX);
+        assert_eq!(workers(&mut s), Some(23));
+        assert_eq!(workers(&mut s), Some(1));
+        assert_eq!(workers(&mut s), None);
+        // workers given back go to the jobs still queued
+        s.release(23, Path::new("a.zip"));
+        assert_eq!(workers(&mut s), Some(6));
+        // memory: a job costs 150 + 130 per worker + 140, the first takes the
+        // 4 workers that fit, the next waits until it ends
+        let mut s = sched(&[100; 4], 24, 2 * 420);
+        assert_eq!(workers(&mut s), Some(4));
+        assert_eq!(workers(&mut s), None);
+        let mut s = sched(&[100; 30], 24, 2 * 420);
+        s.free = 1;
+        s.running = 1;
+        s.used = 420;
+        assert_eq!(workers(&mut s), Some(1));
+        assert_eq!(workers(&mut s), None);
+        // alone, a job runs even if the budget is too small
+        let mut s = sched(&[100], 24, 0);
+        assert_eq!(workers(&mut s), Some(1));
+    }
+
+    #[test]
+    fn open_source_refuses_swapped_files() {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/tmp/unit_open_source");
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let f = d.join("f");
+        fs::write(&f, b"abc").unwrap();
+        assert!(open_source(&f, 3).is_ok());
+        assert!(open_source(&f, 2).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let link = d.join("link");
+            std::os::unix::fs::symlink(&f, &link).unwrap();
+            assert!(open_source(&link, 3).is_err());
+            // a FIFO with no writer would block a plain open forever
+            let fifo = d.join("fifo");
+            let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            // SAFETY: NUL-terminated path
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            assert!(open_source(&fifo, 0).is_err());
+        }
+    }
+}
