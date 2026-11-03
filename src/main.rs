@@ -79,11 +79,14 @@ enum Cmd {
         format: Format,
     },
     /// Check zips; exit status is non-zero if any is not valid RVZSTD or
-    /// TorrentZip (told apart by the zip comment)
+    /// TorrentZip (told apart by the zip comment), or not the --format given
     Verify {
         /// Also decompress, check CRCs and re-encode to compare the data
         #[arg(long)]
         deep: bool,
+        /// Require this format (default: any, told apart by the zip comment)
+        #[arg(long, value_enum)]
+        format: Option<Format>,
         #[arg(required = true)]
         zips: Vec<PathBuf>,
     },
@@ -836,7 +839,7 @@ fn main() {
                 }
             }
         }
-        Cmd::Verify { deep, zips } => {
+        Cmd::Verify { deep, format, zips } => {
             let workers = fit_workers(total, mem.saturating_sub(decoder_mem_mib())) as u32;
             // made on first use, one per format
             let mut encs: [Option<Codec>; 2] = [None, None];
@@ -852,6 +855,9 @@ fn main() {
                         let Some(fmt) = Format::detect(&a.comment) else {
                             return Err("no RVZSTD or TorrentZip comment".into());
                         };
+                        if let Some(want) = format.filter(|&w| w != fmt) {
+                            return Err(format!("{}, expected {}", fmt.name(), want.name()));
+                        }
                         let enc = if deep {
                             let slot = &mut encs[fmt as usize];
                             if slot.is_none() {

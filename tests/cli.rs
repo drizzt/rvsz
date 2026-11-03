@@ -196,6 +196,24 @@ fn trrntzip_pack_verify_extract() {
 }
 
 #[test]
+fn verify_format_restricts() {
+    let t = tmp("verify_format");
+    let src = t.join("src");
+    corpus(&src);
+    let rv = t.join("rv.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&rv)));
+    let tz = t.join("tz.zip");
+    assert!(tz_pack(&src, &tz).status.success());
+    let verify = |extra: &[&str], z: &Path| ok(bin().arg("verify").args(extra).arg(z));
+    assert!(verify(&["--format", "rvzstd"], &rv));
+    assert!(!verify(&["--format", "trrntzip"], &rv));
+    assert!(verify(&["--format", "trrntzip"], &tz));
+    assert!(!verify(&["--format", "rvzstd"], &tz));
+    assert!(verify(&[], &rv));
+    assert!(verify(&[], &tz));
+}
+
+#[test]
 fn trrntzip_batch() {
     let t = tmp("trrntzip_batch");
     let src = t.join("src");

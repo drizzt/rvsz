@@ -21,8 +21,10 @@ rvsz pack <dir|zip>... [-o out]    dir -> <dir>.zip; zip is rewritten in place;
 rvsz batch <folder>... [-o outdir] rewrite every *.zip under each folder, recursively;
                                    with -o, all folders merge into outdir
 rvsz batch --pack-dirs <folder>... each subdir -> <name>.zip, top-level *.zip rewritten
-rvsz verify [--deep] <zip>...      exit 1 if any zip is not valid RVZSTD or
-                                   TorrentZip (picked by the zip comment)
+rvsz verify [--deep] [--format rvzstd|trrntzip] <zip>...
+                                   exit 1 if any zip is not valid RVZSTD or
+                                   TorrentZip (picked by the zip comment), or
+                                   not the --format given
 rvsz extract <zip> [-o dir]
 
 pack and batch options:
