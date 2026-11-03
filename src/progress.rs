@@ -47,6 +47,9 @@ struct State {
     finished: u64,
     total: u64,
     samples: VecDeque<(Instant, f64)>,
+    /// Name column width: the longest name started so far. It only grows,
+    /// so rows do not shift when jobs come and go.
+    name_w: usize,
     /// Lines of the display now on screen, below the cursor's line start.
     drawn: usize,
 }
@@ -82,6 +85,7 @@ impl Progress {
                 finished: 0,
                 total,
                 samples: VecDeque::new(),
+                name_w: 0,
                 drawn: 0,
             }),
         };
@@ -143,7 +147,12 @@ impl Progress {
             created: Instant::now(),
             begun_ms: AtomicU64::new(0),
         });
-        self.lock().rows.push(row.clone());
+        let w = name.chars().count();
+        {
+            let mut st = self.lock();
+            st.name_w = st.name_w.max(w);
+            st.rows.push(row.clone());
+        }
         Bar {
             p: self,
             row: Some(row),
@@ -342,13 +351,7 @@ fn render(st: &State, now: Instant, cols: usize, rows: usize, color: bool) -> Ve
     let multi = st.jobs_total > 1;
     // keep a line for the cursor and one for the total
     let max = rows.saturating_sub(1 + multi as usize).max(1);
-    let name_w = st
-        .rows
-        .iter()
-        .map(|r| r.name.chars().count())
-        .max()
-        .unwrap_or(0)
-        .min(cols / 2);
+    let name_w = st.name_w.min(cols / 2);
     let mut out = Vec::new();
     let shown = if st.rows.len() > max {
         max - 1
@@ -426,8 +429,19 @@ mod tests {
             finished: 300,
             total: 1000,
             samples: VecDeque::new(),
+            name_w: names.iter().map(|n| n.chars().count()).max().unwrap_or(0),
             drawn: 0,
         }
+    }
+
+    #[test]
+    fn name_column_stays() {
+        let mut st = state(&["a-long-name.zip", "b.zip"], 5);
+        let before = render(&st, Instant::now(), 80, 24, false);
+        st.rows.remove(0);
+        let after = render(&st, Instant::now(), 80, 24, false);
+        assert_eq!(before[1], after[0]);
+        assert!(after[0].starts_with(" b.zip           ["), "{}", after[0]);
     }
 
     #[test]
