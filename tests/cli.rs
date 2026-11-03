@@ -77,12 +77,12 @@ fn pack_verify_extract() {
     let first = fs::read(&z).unwrap();
     let out = bin().arg("pack").arg(&z).output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).starts_with("skipped"));
-    assert!(ok(bin().args(["--force", "pack"]).arg(&z)));
+    assert!(ok(bin().args(["pack", "--force"]).arg(&z)));
     assert_eq!(first, fs::read(&z).unwrap());
     // a different worker count gives the same bytes
     let z1 = t.join("j1.zip");
     assert!(ok(bin()
-        .args(["-j", "1", "pack"])
+        .args(["pack", "-j", "1"])
         .arg(&src)
         .arg("-o")
         .arg(&z1)));
@@ -229,7 +229,7 @@ fn trrntzip_batch() {
     let out = t.join("out");
     let run = || {
         bin()
-            .args(["-j", "2", "batch", "--format", "trrntzip"])
+            .args(["batch", "-j", "2", "--format", "trrntzip"])
             .arg(&src)
             .arg("-o")
             .arg(&out)
@@ -763,8 +763,8 @@ fn sigint_removes_temp_file() {
     let out = t.join("out");
     fs::create_dir_all(&out).unwrap();
     let mut child = bin()
-        .arg("-j1")
         .arg("pack")
+        .arg("-j1")
         .arg(&src)
         .arg("-o")
         .arg(out.join("o.zip"))

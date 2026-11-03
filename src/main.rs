@@ -15,7 +15,7 @@ mod validate;
 mod zipread;
 mod zipwrite;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use codec::Codec;
 use color::{GREEN, GREY, RED, SKY};
 use entries::{Entry, Source};
@@ -36,21 +36,42 @@ use zipwrite::{Format, ZipWriter};
     about = "Write and check RomVault RVZSTD or TorrentZip zip files"
 )]
 struct Cli {
-    /// Total zstd worker threads; with TorrentZip, zips packed at once
-    /// (default: number of CPUs)
-    #[arg(short = 'j', long, global = true)]
-    jobs: Option<usize>,
-    /// Memory budget in MiB for concurrent encoders and decoders (default: 3/4 of MemAvailable)
-    #[arg(long, global = true)]
-    max_mem: Option<u64>,
-    /// Rewrite even if the target is already valid in the output format
-    #[arg(long, global = true)]
-    force: bool,
-    /// Print each entry as it is packed (on stderr)
-    #[arg(short, long, global = true)]
-    verbose: bool,
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Args)]
+struct Resources {
+    /// Total zstd worker threads; with TorrentZip, zips packed at once
+    /// (default: number of CPUs)
+    #[arg(short = 'j', long)]
+    jobs: Option<usize>,
+    /// Memory budget in MiB for concurrent encoders and decoders (default: 3/4 of MemAvailable)
+    #[arg(long)]
+    max_mem: Option<u64>,
+}
+
+impl Resources {
+    /// Total workers and memory budget in MiB.
+    fn budget(&self) -> (usize, u64) {
+        let total = self
+            .jobs
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        let mem = self.max_mem.unwrap_or_else(|| mem_available_mib() * 3 / 4);
+        (total, mem)
+    }
+}
+
+#[derive(Args)]
+struct PackOpts {
+    #[command(flatten)]
+    res: Resources,
+    /// Rewrite even if the target is already valid in the output format
+    #[arg(long)]
+    force: bool,
+    /// Print each entry as it is packed (on stderr)
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -65,6 +86,8 @@ enum Cmd {
         /// Output format
         #[arg(long, value_enum, default_value_t = Format::Rvzstd)]
         format: Format,
+        #[command(flatten)]
+        opts: PackOpts,
     },
     /// Rewrite every *.zip under each folder, recursively
     Batch {
@@ -79,6 +102,8 @@ enum Cmd {
         /// Output format
         #[arg(long, value_enum, default_value_t = Format::Rvzstd)]
         format: Format,
+        #[command(flatten)]
+        opts: PackOpts,
     },
     /// Check zips; exit status is non-zero if any is not valid RVZSTD or
     /// TorrentZip (told apart by the zip comment), or not the --format given
@@ -91,6 +116,12 @@ enum Cmd {
         format: Option<Format>,
         #[arg(required = true)]
         zips: Vec<PathBuf>,
+        /// zstd worker threads for --deep re-encoding (default: number of CPUs)
+        #[arg(short = 'j', long)]
+        jobs: Option<usize>,
+        /// Memory budget in MiB for --deep (default: 3/4 of MemAvailable)
+        #[arg(long)]
+        max_mem: Option<u64>,
     },
     /// Extract a zip
     Extract {
@@ -766,16 +797,14 @@ fn main() {
         default_hook(info);
         zipwrite::try_remove_temp_files();
     }));
-    let total = cli
-        .jobs
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-    let mem = cli.max_mem.unwrap_or_else(|| mem_available_mib() * 3 / 4);
     let ok = match cli.cmd {
         Cmd::Pack {
             mut inputs,
             output,
             format,
+            opts,
         } if inputs.len() == 1 => {
+            let (total, mem) = opts.res.budget();
             let input = inputs.remove(0);
             let dest = output.unwrap_or_else(|| default_pack_output(&input));
             // alone, the job gets every worker that fits whatever its size
@@ -784,13 +813,23 @@ fn main() {
                 src: input,
                 dest,
             };
-            run_jobs(vec![job], format, total, mem, cli.force, cli.verbose, false)
+            run_jobs(
+                vec![job],
+                format,
+                total,
+                mem,
+                opts.force,
+                opts.verbose,
+                false,
+            )
         }
         Cmd::Pack {
             inputs,
             output,
             format,
+            opts,
         } => {
+            let (total, mem) = opts.res.budget();
             let r = (|| {
                 if let Some(out) = &output {
                     fs::create_dir_all(out)?;
@@ -819,7 +858,7 @@ fn main() {
                             dest,
                         })
                         .collect();
-                    run_jobs(jobs, format, total, mem, cli.force, cli.verbose, true)
+                    run_jobs(jobs, format, total, mem, opts.force, opts.verbose, true)
                 }
                 Err(e) => {
                     eprintln!("{}{e}", err_word());
@@ -832,7 +871,9 @@ fn main() {
             output,
             pack_dirs,
             format,
+            opts,
         } => {
+            let (total, mem) = opts.res.budget();
             let r = (|| {
                 let mut jobs = Vec::new();
                 for folder in &folders {
@@ -858,7 +899,7 @@ fn main() {
                             dest,
                         })
                         .collect();
-                    run_jobs(jobs, format, total, mem, cli.force, cli.verbose, true)
+                    run_jobs(jobs, format, total, mem, opts.force, opts.verbose, true)
                 }
                 Err(e) => {
                     eprintln!("{}{e}", err_word());
@@ -866,7 +907,14 @@ fn main() {
                 }
             }
         }
-        Cmd::Verify { deep, format, zips } => {
+        Cmd::Verify {
+            deep,
+            format,
+            zips,
+            jobs,
+            max_mem,
+        } => {
+            let (total, mem) = Resources { jobs, max_mem }.budget();
             let workers = fit_workers(total, mem.saturating_sub(decoder_mem_mib())) as u32;
             // made on first use, one per format
             let mut encs: [Option<Codec>; 2] = [None, None];
