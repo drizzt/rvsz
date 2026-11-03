@@ -214,6 +214,11 @@ fn verify_format_restricts() {
     assert!(!verify(&["--format", "rvzstd"], &tz));
     assert!(verify(&[], &rv));
     assert!(verify(&[], &tz));
+    let out = bin().arg("verify").arg(&rv).arg(&tz).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}: RVZSTD\n{}: TorrentZip\n", rv.display(), tz.display())
+    );
 }
 
 #[test]
