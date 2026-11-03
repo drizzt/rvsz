@@ -4,7 +4,7 @@
 
 [package]
 name = "rvsz"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Writes, verifies and extracts zips byte-identical to RomVault RVZSTD and TorrentZip structured zips"
