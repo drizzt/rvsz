@@ -277,22 +277,35 @@ fn fit(s: &str, w: usize) -> String {
 fn row_line(r: &Row, now: Instant, cols: usize, name_w: usize) -> String {
     let total = r.total.load(Ordering::Relaxed);
     let elapsed = now.saturating_duration_since(r.created);
+    // a line as wide as the terminal would wrap and break the erase
+    let room = cols.saturating_sub(1);
     let tail = if total == 0 {
         format!("checking {}", clock(elapsed.as_secs()))
     } else {
         let done = r.done.load(Ordering::Relaxed).min(total);
         let t = elapsed.as_secs_f64() - r.begun_ms.load(Ordering::Relaxed) as f64 / 1000.0;
         let rate = if t > 0.5 { done as f64 / t } else { 0.0 };
-        format!(
-            "{:3.0}% {}/{} {}/s",
-            r.fraction() * 100.0,
-            size(done as f64),
-            size(total as f64),
-            size(rate)
-        )
+        let eta = if rate > 0.0 {
+            clock(((total - done) as f64 / rate) as u64)
+        } else {
+            "--".to_string()
+        };
+        let pct = format!("{:3.0}%", r.fraction() * 100.0);
+        let sizes = format!(" {}/{}", size(done as f64), size(total as f64));
+        let rate = format!(" {}/s", size(rate));
+        // keep the ETA on a narrow terminal: drop sizes, then rate, so the
+        // tail fits next to a minimum width name (leading space, 8, space)
+        let heads = [
+            format!("{pct}{sizes}{rate} ETA "),
+            format!("{pct}{rate} ETA "),
+            format!("{pct} ETA "),
+        ];
+        let head = heads
+            .iter()
+            .find(|h| 10 + h.len() + eta.len() <= room)
+            .unwrap_or(&heads[2]);
+        format!("{head}{eta}")
     };
-    // a line as wide as the terminal would wrap and break the erase
-    let room = cols.saturating_sub(1);
     let name_w = name_w.min(room.saturating_sub(tail.len() + 2)).max(8);
     let bar_w = room.saturating_sub(name_w + tail.len() + 6).min(30);
     let bar = if total == 0 || bar_w < 5 {
@@ -404,6 +417,7 @@ mod tests {
         assert_eq!(l.len(), 3);
         assert!(l[0].starts_with(" a.zip    [====="), "{}", l[0]);
         assert!(l[0].contains(" 25% 250 B/1000 B "), "{}", l[0]);
+        assert!(l[0].ends_with(" ETA --"), "{}", l[0]);
         // 300 finished + 2 * 100 * 0.25
         assert!(
             l[2].starts_with("total 3/5  35.0%  350 B/1000 B"),
@@ -411,6 +425,26 @@ mod tests {
             l[2]
         );
         assert!(l.iter().all(|s| s.chars().count() < 80));
+    }
+
+    #[test]
+    fn row_eta() {
+        let st = state(&["a.zip"], 1);
+        // 250 of 1000 in 10 s: 25 B/s, 750 left
+        let now = st.rows[0].created + Duration::from_secs(10);
+        let l = &render(&st, now, 80, 24)[0];
+        assert!(l.ends_with(" ETA 0:30"), "{l}");
+    }
+
+    #[test]
+    fn row_eta_narrow() {
+        let st = state(&["a.zip"], 1);
+        let now = st.rows[0].created + Duration::from_secs(10);
+        // the full tail is 32 chars and does not fit next to the name
+        let l = &render(&st, now, 30, 24)[0];
+        assert!(l.ends_with(" ETA 0:30"), "{l}");
+        assert!(l.chars().count() < 30, "{l}");
+        assert!(l.contains("25%"), "{l}");
     }
 
     #[test]
