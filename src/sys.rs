@@ -158,7 +158,7 @@ mod unix {
     }
 
     /// Terminals take ANSI escapes as they are.
-    pub fn enable_vt() -> bool {
+    pub fn enable_vt(_stderr: bool) -> bool {
         true
     }
 }
@@ -329,15 +329,21 @@ mod windows {
         (ok && c > 0 && r > 0).then_some((c as u16, r as u16))
     }
 
-    /// Turns on ANSI escapes in the console on stderr; false if not a console.
-    pub fn enable_vt() -> bool {
+    /// Turns on ANSI escapes in the console on stderr (or stdout); false if
+    /// not a console.
+    pub fn enable_vt(stderr: bool) -> bool {
         use windows_sys::Win32::System::Console::{
             ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE,
-            SetConsoleMode,
+            STD_OUTPUT_HANDLE, SetConsoleMode,
+        };
+        let std = if stderr {
+            STD_ERROR_HANDLE
+        } else {
+            STD_OUTPUT_HANDLE
         };
         // SAFETY: plain handle calls; a bad handle only makes them fail
         unsafe {
-            let h = GetStdHandle(STD_ERROR_HANDLE);
+            let h = GetStdHandle(std);
             let mut mode = 0;
             GetConsoleMode(h, &mut mode) != 0
                 && SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0

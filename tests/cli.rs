@@ -8,7 +8,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_rvsz"))
+    // tests match plain text: color settings of the caller must not leak in
+    let mut c = Command::new(env!("CARGO_BIN_EXE_rvsz"));
+    c.env_remove("NO_COLOR").env_remove("CLICOLOR_FORCE");
+    c
 }
 
 fn tmp(name: &str) -> PathBuf {

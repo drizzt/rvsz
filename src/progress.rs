@@ -6,6 +6,7 @@
 //! row per running job and, for more than one job, a total line with rate
 //! and ETA. Other output goes through `line` so it scrolls above the rows.
 
+use crate::color::{self, GREEN, GREY, SKY};
 use crate::sys;
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
@@ -52,6 +53,7 @@ struct State {
 
 pub struct Progress {
     on: bool,
+    color: bool,
     st: Mutex<State>,
 }
 
@@ -68,10 +70,11 @@ impl Progress {
     pub fn run<T>(jobs: usize, total: u64, f: impl FnOnce(&Progress) -> T) -> T {
         let on = io::stderr().is_terminal()
             && std::env::var_os("TERM").is_none_or(|t| t != "dumb")
-            && sys::enable_vt()
+            && sys::enable_vt(true)
             && sys::term_size().is_some();
         let p = Progress {
             on,
+            color: on && color::enabled(true),
             st: Mutex::new(State {
                 rows: Vec::new(),
                 jobs_done: 0,
@@ -182,7 +185,7 @@ impl Progress {
             st.samples.pop_front();
         }
         let (cols, rows) = sys::term_size().unwrap_or((80, 24));
-        let lines = render(&st, now, cols as usize, rows as usize);
+        let lines = render(&st, now, cols as usize, rows as usize, self.color);
         let mut err = io::stderr().lock();
         erase(&mut err, &mut st);
         between(&mut err);
@@ -274,13 +277,15 @@ fn fit(s: &str, w: usize) -> String {
     out
 }
 
-fn row_line(r: &Row, now: Instant, cols: usize, name_w: usize) -> String {
+fn row_line(r: &Row, now: Instant, cols: usize, name_w: usize, color: bool) -> String {
     let total = r.total.load(Ordering::Relaxed);
     let elapsed = now.saturating_duration_since(r.created);
     // a line as wide as the terminal would wrap and break the erase
     let room = cols.saturating_sub(1);
-    let tail = if total == 0 {
-        format!("checking {}", clock(elapsed.as_secs()))
+    // (text, text colored), so the width math only sees the plain text
+    let (tail, tail_c) = if total == 0 {
+        let t = format!("checking {}", clock(elapsed.as_secs()));
+        (t.clone(), color::paint(true, GREY, &t))
     } else {
         let done = r.done.load(Ordering::Relaxed).min(total);
         let t = elapsed.as_secs_f64() - r.begun_ms.load(Ordering::Relaxed) as f64 / 1000.0;
@@ -304,26 +309,36 @@ fn row_line(r: &Row, now: Instant, cols: usize, name_w: usize) -> String {
             .iter()
             .find(|h| 10 + h.len() + eta.len() <= room)
             .unwrap_or(&heads[2]);
-        format!("{head}{eta}")
+        (
+            format!("{head}{eta}"),
+            format!("{head}{}", color::paint(true, SKY, &eta)),
+        )
     };
     let name_w = name_w.min(room.saturating_sub(tail.len() + 2)).max(8);
     let bar_w = room.saturating_sub(name_w + tail.len() + 6).min(30);
-    let bar = if total == 0 || bar_w < 5 {
-        String::new()
+    let (bar, bar_c) = if total == 0 || bar_w < 5 {
+        (String::new(), String::new())
     } else {
         let full = (r.fraction() * bar_w as f64) as usize;
         let mut b = "=".repeat(full);
         if full < bar_w {
             b.push('>');
-            b.push_str(&" ".repeat(bar_w - full - 1));
         }
-        format!("[{b}] ")
+        let rest = " ".repeat(bar_w - b.len());
+        (
+            format!("[{b}{rest}] "),
+            format!("[{}{rest}] ", color::paint(true, GREEN, &b)),
+        )
     };
-    let l = format!(" {:<name_w$} {bar}{tail}", fit(&r.name, name_w));
-    fit(&l, room)
+    let name = fit(&r.name, name_w);
+    let l = format!(" {name:<name_w$} {bar}{tail}");
+    if !color || l.chars().count() > room {
+        return fit(&l, room);
+    }
+    format!(" {name:<name_w$} {bar_c}{tail_c}")
 }
 
-fn render(st: &State, now: Instant, cols: usize, rows: usize) -> Vec<String> {
+fn render(st: &State, now: Instant, cols: usize, rows: usize, color: bool) -> Vec<String> {
     let multi = st.jobs_total > 1;
     // keep a line for the cursor and one for the total
     let max = rows.saturating_sub(1 + multi as usize).max(1);
@@ -341,7 +356,7 @@ fn render(st: &State, now: Instant, cols: usize, rows: usize) -> Vec<String> {
         st.rows.len()
     };
     for r in &st.rows[..shown] {
-        out.push(row_line(r, now, cols, name_w));
+        out.push(row_line(r, now, cols, name_w, color));
     }
     if shown < st.rows.len() {
         out.push(format!(" ... {} more", st.rows.len() - shown));
@@ -376,7 +391,12 @@ fn render(st: &State, now: Instant, cols: usize, rows: usize) -> Vec<String> {
             size(st.total as f64),
             size(rate)
         );
-        out.push(fit(&l, cols.saturating_sub(1)));
+        let room = cols.saturating_sub(1);
+        if color && l.chars().count() <= room {
+            out.push(format!("{}{}", color::paint(true, SKY, "total"), &l[5..]));
+        } else {
+            out.push(fit(&l, room));
+        }
     }
     out
 }
@@ -413,7 +433,7 @@ mod tests {
     #[test]
     fn rows_and_total() {
         let st = state(&["a.zip", "bb.zip"], 5);
-        let l = render(&st, Instant::now(), 80, 24);
+        let l = render(&st, Instant::now(), 80, 24, false);
         assert_eq!(l.len(), 3);
         assert!(l[0].starts_with(" a.zip    [====="), "{}", l[0]);
         assert!(l[0].contains(" 25% 250 B/1000 B "), "{}", l[0]);
@@ -432,7 +452,7 @@ mod tests {
         let st = state(&["a.zip"], 1);
         // 250 of 1000 in 10 s: 25 B/s, 750 left
         let now = st.rows[0].created + Duration::from_secs(10);
-        let l = &render(&st, now, 80, 24)[0];
+        let l = &render(&st, now, 80, 24, false)[0];
         assert!(l.ends_with(" ETA 0:30"), "{l}");
     }
 
@@ -441,7 +461,7 @@ mod tests {
         let st = state(&["a.zip"], 1);
         let now = st.rows[0].created + Duration::from_secs(10);
         // the full tail is 32 chars and does not fit next to the name
-        let l = &render(&st, now, 30, 24)[0];
+        let l = &render(&st, now, 30, 24, false)[0];
         assert!(l.ends_with(" ETA 0:30"), "{l}");
         assert!(l.chars().count() < 30, "{l}");
         assert!(l.contains("25%"), "{l}");
@@ -450,7 +470,7 @@ mod tests {
     #[test]
     fn one_job_has_no_total() {
         let st = state(&["a.zip"], 1);
-        assert_eq!(render(&st, Instant::now(), 80, 24).len(), 1);
+        assert_eq!(render(&st, Instant::now(), 80, 24, false).len(), 1);
     }
 
     #[test]
@@ -458,7 +478,7 @@ mod tests {
         let names: Vec<String> = (0..30).map(|i| format!("{i}.zip")).collect();
         let names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         let st = state(&names, 40);
-        let l = render(&st, Instant::now(), 80, 10);
+        let l = render(&st, Instant::now(), 80, 10, false);
         assert_eq!(l.len(), 9);
         assert_eq!(l[7], " ... 23 more");
     }
@@ -467,17 +487,42 @@ mod tests {
     fn long_name_cut() {
         let long = "x".repeat(200);
         let st = state(&[&long], 1);
-        let l = &render(&st, Instant::now(), 60, 24)[0];
+        let l = &render(&st, Instant::now(), 60, 24, false)[0];
         assert!(l.chars().count() < 60, "{l}");
         assert!(l.contains("~ "), "{l}");
         assert!(l.contains("25%"), "{l}");
+    }
+
+    fn strip(s: &str) -> String {
+        let mut out = String::new();
+        let mut it = s.chars();
+        while let Some(c) = it.next() {
+            if c == '\x1b' {
+                it.by_ref().find(|&c| c == 'm');
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn color_same_text() {
+        let st = state(&["a.zip", "bb.zip"], 5);
+        st.rows[1].total.store(0, Ordering::Relaxed);
+        let now = st.rows[0].created + Duration::from_secs(10);
+        let plain = render(&st, now, 80, 24, false);
+        let colored = render(&st, now, 80, 24, true);
+        assert!(colored.iter().all(|l| l.contains('\x1b')), "{colored:?}");
+        let stripped: Vec<String> = colored.iter().map(|l| strip(l)).collect();
+        assert_eq!(stripped, plain);
     }
 
     #[test]
     fn checking_before_total() {
         let st = state(&["a.zip"], 1);
         st.rows[0].total.store(0, Ordering::Relaxed);
-        let l = &render(&st, Instant::now(), 80, 24)[0];
+        let l = &render(&st, Instant::now(), 80, 24, false)[0];
         assert!(l.contains("checking 0:00"), "{l}");
         assert!(!l.contains('['), "{l}");
     }

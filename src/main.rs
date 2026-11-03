@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod codec;
+mod color;
 mod cp437;
 mod deflate;
 mod entries;
@@ -16,6 +17,7 @@ mod zipwrite;
 
 use clap::{Parser, Subcommand};
 use codec::Codec;
+use color::{GREEN, GREY, RED, SKY};
 use entries::{Entry, Source};
 use progress::{Bar, Progress};
 use std::collections::HashSet;
@@ -293,7 +295,14 @@ fn pack(
     if !force && dest.exists() {
         if verbose {
             // reads every source file to compare CRCs
-            bar.line(true, &format!("checking {}", dest.display()));
+            bar.line(
+                true,
+                &format!(
+                    "{}{}",
+                    color::word(true, GREY, "checking", 9),
+                    dest.display()
+                ),
+            );
         }
         if zip_matches(dest, fmt, &src, &list)? {
             return Ok(Outcome::Skipped);
@@ -599,22 +608,35 @@ fn run_jobs(
                         let bar = p.start(&name, job.size);
                         if batch && !p.on() {
                             // a big zip at level 19 can take an hour: show it started
-                            eprintln!("packing {} ({w} workers)", job.dest.display());
+                            eprintln!(
+                                "{}{} ({w} workers)",
+                                color::word(true, SKY, "packing", 8),
+                                job.dest.display()
+                            );
                         }
                         let r = Codec::new(fmt, w as u32).and_then(|mut enc| {
                             pack(&job.src, &job.dest, fmt, force, verbose, &mut enc, &bar)
                         });
                         drop(bar);
                         match r {
-                            Ok(Outcome::Written) => {
-                                p.line(false, &format!("packed  {}", job.dest.display()))
-                            }
+                            Ok(Outcome::Written) => p.line(
+                                false,
+                                &format!(
+                                    "{}{}",
+                                    color::word(false, GREEN, "packed", 8),
+                                    job.dest.display()
+                                ),
+                            ),
                             Ok(Outcome::Skipped) => p.line(
                                 false,
-                                &format!("skipped {} (already valid)", job.dest.display()),
+                                &format!(
+                                    "{}{} (already valid)",
+                                    color::word(false, GREY, "skipped", 8),
+                                    job.dest.display()
+                                ),
                             ),
                             Err(e) => {
-                                p.line(true, &format!("error: {}: {e}", job.src.display()));
+                                p.line(true, &format!("{}{}: {e}", err_word(), job.src.display()));
                                 failed.store(true, Ordering::Relaxed);
                             }
                         }
@@ -729,6 +751,11 @@ fn extract(zip: &Path, outdir: &Path, bar: &Bar) -> io::Result<()> {
     Ok(())
 }
 
+/// `error: ` prefix for stderr lines.
+fn err_word() -> String {
+    color::word(true, RED, "error:", 7)
+}
+
 fn main() {
     let cli = Cli::parse();
     sys::cleanup_on_signal();
@@ -795,7 +822,7 @@ fn main() {
                     run_jobs(jobs, format, total, mem, cli.force, cli.verbose, true)
                 }
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    eprintln!("{}{e}", err_word());
                     false
                 }
             }
@@ -834,7 +861,7 @@ fn main() {
                     run_jobs(jobs, format, total, mem, cli.force, cli.verbose, true)
                 }
                 Err(e) => {
-                    eprintln!("error: {e}");
+                    eprintln!("{}{e}", err_word());
                     false
                 }
             }
@@ -871,9 +898,19 @@ fn main() {
                     });
                     drop(bar);
                     match r {
-                        Ok(()) => p.line(false, &format!("ok      {}", z.display())),
+                        Ok(()) => p.line(
+                            false,
+                            &format!("{}{}", color::word(false, GREEN, "ok", 8), z.display()),
+                        ),
                         Err(e) => {
-                            p.line(false, &format!("invalid {}: {e}", z.display()));
+                            p.line(
+                                false,
+                                &format!(
+                                    "{}{}: {e}",
+                                    color::word(false, RED, "invalid", 8),
+                                    z.display()
+                                ),
+                            );
                             ok = false;
                         }
                     }
@@ -891,7 +928,7 @@ fn main() {
                 match r {
                     Ok(()) => true,
                     Err(e) => {
-                        p.line(true, &format!("error: {}: {e}", zip.display()));
+                        p.line(true, &format!("{}{}: {e}", err_word(), zip.display()));
                         false
                     }
                 }
