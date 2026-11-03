@@ -11,7 +11,7 @@ use crate::sys::{self, FileExt};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 pub const METHOD_STORED: u16 = 0;
 pub const METHOD_DEFLATE: u16 = 8;
@@ -237,12 +237,10 @@ impl Write for Counter<'_> {
     }
 }
 
-/// Temp files being written, removed by `remove_temp_files` on a signal.
+/// Temp files being written, removed by `remove_temp_files_and_exit` on a
+/// signal. A temp file is created and pushed under one lock, so it exists
+/// only while it is in the list.
 static TEMP_FILES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
-pub fn track_temp(p: &Path) {
-    TEMP_FILES.lock().unwrap().push(p.to_path_buf());
-}
 
 pub fn untrack_temp(p: &Path) {
     let mut v = TEMP_FILES.lock().unwrap();
@@ -251,21 +249,26 @@ pub fn untrack_temp(p: &Path) {
     }
 }
 
-/// Removes every tracked temp file. The lock is kept, so no writer can
-/// register a new one before the process exits.
-pub fn remove_temp_files() {
-    for p in TEMP_FILES.lock().unwrap().iter() {
-        let _ = fs::remove_file(p);
-    }
+/// Removes every tracked temp file, then exits with `code`. The lock is
+/// held until the process is gone, so no writer can create a new temp file
+/// during or after the cleanup. A poisoned lock is still used: the list is
+/// valid, and giving up would leave every temp file behind.
+pub fn remove_temp_files_and_exit(code: i32) -> ! {
+    remove_all(&TEMP_FILES.lock().unwrap_or_else(PoisonError::into_inner));
+    std::process::exit(code)
 }
 
-/// Like `remove_temp_files`, but gives up if the list is locked, so a panic
+/// Removes every tracked temp file unless the list is locked, so a panic
 /// hook running on a thread that holds the lock cannot deadlock.
 pub fn try_remove_temp_files() {
     if let Ok(v) = TEMP_FILES.try_lock() {
-        for p in v.iter() {
-            let _ = fs::remove_file(p);
-        }
+        remove_all(&v);
+    }
+}
+
+fn remove_all(v: &[PathBuf]) {
+    for p in v {
+        let _ = fs::remove_file(p);
     }
 }
 
@@ -287,17 +290,20 @@ pub fn create_temp(dest: &Path) -> io::Result<(File, PathBuf)> {
         t.push(fname);
         t.push(format!(".{}.{n}.tmp", std::process::id()));
         let tmp = dir.join(t);
-        // tracked before it exists: a signal right after the open still finds it
-        track_temp(&tmp);
         // read access is needed to move data for the zip64 fix-up
         let mut o = fs::OpenOptions::new();
         o.read(true).write(true).create_new(true);
         sys::temp_mode(&mut o, old.is_some());
-        let r = o.open(&tmp);
+        // open and track under one lock: the signal cleanup either runs
+        // before (and exits with the lock held, so this never runs) or
+        // after, and then finds the file in the list
+        let r = {
+            let mut v = TEMP_FILES.lock().unwrap();
+            o.open(&tmp).inspect(|_| v.push(tmp.clone()))
+        };
         let f = match r {
             Ok(f) => f,
             Err(e) => {
-                untrack_temp(&tmp);
                 if e.kind() == io::ErrorKind::AlreadyExists {
                     continue;
                 }

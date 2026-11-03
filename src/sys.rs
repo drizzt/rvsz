@@ -132,8 +132,7 @@ mod unix {
         };
         std::thread::spawn(move || {
             if let Some(sig) = sigs.forever().next() {
-                crate::zipwrite::remove_temp_files();
-                std::process::exit(128 + sig);
+                crate::zipwrite::remove_temp_files_and_exit(128 + sig);
             }
         });
     }
@@ -292,8 +291,7 @@ mod windows {
     pub fn cleanup_on_signal() {
         use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
         unsafe extern "system" fn handler(_: u32) -> windows_sys::core::BOOL {
-            crate::zipwrite::remove_temp_files();
-            std::process::exit(0xC000_013A_u32 as i32);
+            crate::zipwrite::remove_temp_files_and_exit(0xC000_013A_u32 as i32);
         }
         // SAFETY: handler is a valid function for the whole process life
         if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
