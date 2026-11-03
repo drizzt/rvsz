@@ -196,9 +196,6 @@ fn fix_comment(b: &mut [u8]) {
     b[n - 8..].copy_from_slice(s.as_bytes());
 }
 
-// Windows file names are case-insensitive: the second write would
-// overwrite the first
-#[cfg(unix)]
 #[test]
 fn case_collision_fails() {
     let t = tmp("case_collision");
@@ -206,6 +203,11 @@ fn case_collision_fails() {
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("ABC"), b"1").unwrap();
     fs::write(src.join("abc"), b"2").unwrap();
+    // On a case-insensitive file system (Windows, macOS by default) the
+    // second write overwrote the first, so there is nothing to test
+    if fs::read_dir(&src).unwrap().count() < 2 {
+        return;
+    }
     assert!(!ok(bin()
         .arg("pack")
         .arg(&src)
