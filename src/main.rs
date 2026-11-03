@@ -2,7 +2,9 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+mod codec;
 mod cp437;
+mod deflate;
 mod entries;
 mod progress;
 mod rvzstd;
@@ -13,9 +15,9 @@ mod zipread;
 mod zipwrite;
 
 use clap::{Parser, Subcommand};
+use codec::Codec;
 use entries::{Entry, Source};
 use progress::{Bar, Progress};
-use rvzstd::Encoder;
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -24,18 +26,22 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use zipread::{Archive, pump};
-use zipwrite::ZipWriter;
+use zipwrite::{Format, ZipWriter};
 
 #[derive(Parser)]
-#[command(version, about = "Write and check RomVault RVZSTD zip files")]
+#[command(
+    version,
+    about = "Write and check RomVault RVZSTD or TorrentZip zip files"
+)]
 struct Cli {
-    /// Total zstd worker threads (default: number of CPUs)
+    /// Total zstd worker threads; with TorrentZip, zips packed at once
+    /// (default: number of CPUs)
     #[arg(short = 'j', long, global = true)]
     jobs: Option<usize>,
     /// Memory budget in MiB for concurrent encoders and decoders (default: 3/4 of MemAvailable)
     #[arg(long, global = true)]
     max_mem: Option<u64>,
-    /// Rewrite even if the target is already a valid RVZSTD zip
+    /// Rewrite even if the target is already valid in the output format
     #[arg(long, global = true)]
     force: bool,
     /// Print each entry as it is packed (on stderr)
@@ -54,6 +60,9 @@ enum Cmd {
         inputs: Vec<PathBuf>,
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = Format::Rvzstd)]
+        format: Format,
     },
     /// Rewrite every *.zip under each folder, recursively
     Batch {
@@ -65,8 +74,12 @@ enum Cmd {
         /// the *.zip files directly in the folder
         #[arg(long)]
         pack_dirs: bool,
+        /// Output format
+        #[arg(long, value_enum, default_value_t = Format::Rvzstd)]
+        format: Format,
     },
-    /// Check zips; exit status is non-zero if any is not valid RVZSTD
+    /// Check zips; exit status is non-zero if any is not valid RVZSTD or
+    /// TorrentZip (told apart by the zip comment)
     Verify {
         /// Also decompress, check CRCs and re-encode to compare the data
         #[arg(long)]
@@ -95,6 +108,10 @@ fn encoder_mem_mib(workers: usize) -> u64 {
 fn decoder_mem_mib() -> u64 {
     140
 }
+
+/// Peak memory of one TorrentZip job without a decoder: zlib at level 9
+/// needs about 300 KiB, the rest is I/O buffers.
+const DEFLATE_MEM_MIB: u64 = 16;
 
 fn mem_available_mib() -> u64 {
     sys::mem_available_mib().unwrap_or(1024)
@@ -141,11 +158,12 @@ fn write_zip(
     input: Input,
     list: &[Entry],
     dest: &Path,
-    enc: &mut Encoder,
+    fmt: Format,
+    enc: &mut Codec,
     verbose: bool,
     bar: &Bar,
 ) -> io::Result<()> {
-    let mut w = ZipWriter::create(dest)?;
+    let mut w = ZipWriter::create(dest, fmt)?;
     // batch runs several zips at once: the prefix tells their lines apart
     let tag = dest.file_name().unwrap_or_default().to_string_lossy();
     let total: u64 = list.iter().map(|e| e.size).sum();
@@ -203,13 +221,13 @@ fn write_zip(
     w.finish()
 }
 
-/// True if `zip` is valid RVZSTD and holds exactly `list`: same names,
-/// sizes and CRCs (read from the files, or taken from the source zip).
-fn zip_matches(zip: &Path, input: &Input, list: &[Entry]) -> io::Result<bool> {
+/// True if `zip` is valid in format `fmt` and holds exactly `list`: same
+/// names, sizes and CRCs (read from the files, or taken from the source zip).
+fn zip_matches(zip: &Path, fmt: Format, input: &Input, list: &[Entry]) -> io::Result<bool> {
     let Ok(a) = Archive::open(zip) else {
         return Ok(false);
     };
-    if validate::check(&a, None).is_err() || a.entries.len() != list.len() {
+    if validate::check(&a, fmt, None).is_err() || a.entries.len() != list.len() {
         return Ok(false);
     }
     for (z, e) in a.entries.iter().zip(list) {
@@ -239,9 +257,10 @@ fn human(n: u64) -> String {
 fn pack(
     input: &Path,
     dest: &Path,
+    fmt: Format,
     force: bool,
     verbose: bool,
-    enc: &mut Encoder,
+    enc: &mut Codec,
     bar: &Bar,
 ) -> io::Result<Outcome> {
     let (src, list) = if input.is_dir() {
@@ -257,7 +276,7 @@ fn pack(
         (Input::Dir, entries::from_dir(input)?)
     } else {
         let a = Archive::open(input)?;
-        if !force && validate::check(&a, None).is_ok() {
+        if !force && validate::check(&a, fmt, None).is_ok() {
             if !same_file(input, dest) {
                 copy_atomic(input, dest)?;
                 return Ok(Outcome::Written);
@@ -273,11 +292,11 @@ fn pack(
             // reads every source file to compare CRCs
             bar.line(true, &format!("checking {}", dest.display()));
         }
-        if zip_matches(dest, &src, &list)? {
+        if zip_matches(dest, fmt, &src, &list)? {
             return Ok(Outcome::Skipped);
         }
     }
-    write_zip(src, &list, dest, enc, verbose, bar)?;
+    write_zip(src, &list, dest, fmt, enc, verbose, bar)?;
     Ok(Outcome::Written)
 }
 
@@ -458,8 +477,10 @@ fn tree_size(p: &Path) -> u64 {
 /// starts: its share of the free workers is its share of the work not yet
 /// started (a large file next to small ones gets many, equal files get one
 /// each, and the last jobs take the workers that earlier ones gave back).
-/// Running encoders and decoders stay within `budget` MiB.
+/// Running encoders and decoders stay within `budget` MiB. TorrentZip
+/// deflate is single-threaded: there each job takes exactly one worker.
 struct Sched {
+    fmt: Format,
     jobs: Vec<Job>,
     free: usize,
     left: u64,
@@ -469,24 +490,38 @@ struct Sched {
 }
 
 impl Sched {
-    fn job_mem(w: usize, src: &Path) -> u64 {
-        encoder_mem_mib(w) + if src.is_dir() { 0 } else { decoder_mem_mib() }
+    fn job_mem(&self, w: usize, src: &Path) -> u64 {
+        let enc = match self.fmt {
+            Format::Rvzstd => encoder_mem_mib(w),
+            Format::Trrntzip => DEFLATE_MEM_MIB,
+        };
+        enc + if src.is_dir() { 0 } else { decoder_mem_mib() }
     }
 
     /// Next job and its workers, or None if the queue is empty. Some(None):
     /// no memory or worker free yet, wait for a running job to end.
     fn take(&mut self) -> Option<Option<(Job, usize)>> {
         let job = self.jobs.last()?;
-        let dec = Self::job_mem(0, &job.src) - encoder_mem_mib(0);
-        let avail = if self.running == 0 {
-            // alone: run even if the budget is too small, as `pack` does
-            fit_workers(self.free, self.budget.saturating_sub(dec))
-        } else {
-            let mem = self
-                .budget
-                .saturating_sub(self.used + encoder_mem_mib(0) + dec);
-            self.free
-                .min((mem / (encoder_mem_mib(1) - encoder_mem_mib(0))) as usize)
+        let avail = match self.fmt {
+            Format::Trrntzip => {
+                // alone: run even if the budget is too small, as `pack` does
+                let fits =
+                    self.running == 0 || self.used + self.job_mem(1, &job.src) <= self.budget;
+                if fits { self.free.min(1) } else { 0 }
+            }
+            Format::Rvzstd => {
+                let dec = self.job_mem(0, &job.src) - encoder_mem_mib(0);
+                if self.running == 0 {
+                    // alone: run even if the budget is too small, as `pack` does
+                    fit_workers(self.free, self.budget.saturating_sub(dec))
+                } else {
+                    let mem = self
+                        .budget
+                        .saturating_sub(self.used + encoder_mem_mib(0) + dec);
+                    self.free
+                        .min((mem / (encoder_mem_mib(1) - encoder_mem_mib(0))) as usize)
+                }
+            }
         };
         if avail == 0 {
             return Some(None);
@@ -496,20 +531,21 @@ impl Sched {
         let job = self.jobs.pop()?;
         self.free -= w;
         self.left -= job.size;
-        self.used += Self::job_mem(w, &job.src);
+        self.used += self.job_mem(w, &job.src);
         self.running += 1;
         Some(Some((job, w)))
     }
 
     fn release(&mut self, w: usize, src: &Path) {
         self.free += w;
-        self.used -= Self::job_mem(w, src);
+        self.used -= self.job_mem(w, src);
         self.running -= 1;
     }
 }
 
 fn run_jobs(
     mut jobs: Vec<Job>,
+    fmt: Format,
     total: usize,
     budget: u64,
     force: bool,
@@ -521,6 +557,7 @@ fn run_jobs(
     let left = jobs.iter().map(|j| j.size).sum();
     let count = jobs.len();
     let sched = Mutex::new(Sched {
+        fmt,
         left,
         jobs,
         free: total.max(1),
@@ -561,8 +598,8 @@ fn run_jobs(
                             // a big zip at level 19 can take an hour: show it started
                             eprintln!("packing {} ({w} workers)", job.dest.display());
                         }
-                        let r = Encoder::new(w as u32).and_then(|mut enc| {
-                            pack(&job.src, &job.dest, force, verbose, &mut enc, &bar)
+                        let r = Codec::new(fmt, w as u32).and_then(|mut enc| {
+                            pack(&job.src, &job.dest, fmt, force, verbose, &mut enc, &bar)
                         });
                         drop(bar);
                         match r {
@@ -704,7 +741,11 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     let mem = cli.max_mem.unwrap_or_else(|| mem_available_mib() * 3 / 4);
     let ok = match cli.cmd {
-        Cmd::Pack { mut inputs, output } if inputs.len() == 1 => {
+        Cmd::Pack {
+            mut inputs,
+            output,
+            format,
+        } if inputs.len() == 1 => {
             let input = inputs.remove(0);
             let dest = output.unwrap_or_else(|| default_pack_output(&input));
             // alone, the job gets every worker that fits whatever its size
@@ -713,9 +754,13 @@ fn main() {
                 src: input,
                 dest,
             };
-            run_jobs(vec![job], total, mem, cli.force, cli.verbose, false)
+            run_jobs(vec![job], format, total, mem, cli.force, cli.verbose, false)
         }
-        Cmd::Pack { inputs, output } => {
+        Cmd::Pack {
+            inputs,
+            output,
+            format,
+        } => {
             let r = (|| {
                 if let Some(out) = &output {
                     fs::create_dir_all(out)?;
@@ -744,7 +789,7 @@ fn main() {
                             dest,
                         })
                         .collect();
-                    run_jobs(jobs, total, mem, cli.force, cli.verbose, true)
+                    run_jobs(jobs, format, total, mem, cli.force, cli.verbose, true)
                 }
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -756,6 +801,7 @@ fn main() {
             folders,
             output,
             pack_dirs,
+            format,
         } => {
             let r = (|| {
                 let mut jobs = Vec::new();
@@ -782,7 +828,7 @@ fn main() {
                             dest,
                         })
                         .collect();
-                    run_jobs(jobs, total, mem, cli.force, cli.verbose, true)
+                    run_jobs(jobs, format, total, mem, cli.force, cli.verbose, true)
                 }
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -792,11 +838,8 @@ fn main() {
         }
         Cmd::Verify { deep, zips } => {
             let workers = fit_workers(total, mem.saturating_sub(decoder_mem_mib())) as u32;
-            let mut enc = if deep {
-                Some(Encoder::new(workers).expect("zstd encoder"))
-            } else {
-                None
-            };
+            // made on first use, one per format
+            let mut encs: [Option<Codec>; 2] = [None, None];
             let sizes: Vec<u64> = zips
                 .iter()
                 .map(|z| fs::metadata(z).map_or(0, |m| m.len()))
@@ -805,9 +848,21 @@ fn main() {
                 let mut ok = true;
                 for (z, size) in zips.iter().zip(sizes) {
                     let bar = p.start(&z.file_name().unwrap_or_default().to_string_lossy(), size);
-                    let r = Archive::open(z)
-                        .map_err(|e| e.to_string())
-                        .and_then(|a| validate::check(&a, enc.as_mut().map(|e| (e, &bar))));
+                    let r = Archive::open(z).map_err(|e| e.to_string()).and_then(|a| {
+                        let Some(fmt) = Format::detect(&a.comment) else {
+                            return Err("no RVZSTD or TorrentZip comment".into());
+                        };
+                        let enc = if deep {
+                            let slot = &mut encs[fmt as usize];
+                            if slot.is_none() {
+                                *slot = Some(Codec::new(fmt, workers).map_err(|e| e.to_string())?);
+                            }
+                            slot.as_mut().map(|c| (c, &bar))
+                        } else {
+                            None
+                        };
+                        validate::check(&a, fmt, enc).map_err(|e| format!("{}: {e}", fmt.name()))
+                    });
                     drop(bar);
                     match r {
                         Ok(()) => p.line(false, &format!("ok      {}", z.display())),
@@ -855,6 +910,7 @@ mod tests {
             .collect();
         jobs.sort_by_key(|j| j.size);
         Sched {
+            fmt: Format::Rvzstd,
             left: sizes.iter().sum(),
             jobs,
             free,
@@ -897,6 +953,28 @@ mod tests {
         assert_eq!(workers(&mut s), None);
         // alone, a job runs even if the budget is too small
         let mut s = sched(&[100], 24, 0);
+        assert_eq!(workers(&mut s), Some(1));
+    }
+
+    #[test]
+    fn sched_trrntzip_one_worker_per_job() {
+        let mut s = sched(&[4000, 50, 50, 50], 3, u64::MAX);
+        s.fmt = Format::Trrntzip;
+        for _ in 0..3 {
+            assert_eq!(workers(&mut s), Some(1));
+        }
+        assert_eq!(workers(&mut s), None);
+        s.release(1, Path::new("a.zip"));
+        assert_eq!(workers(&mut s), Some(1));
+        // memory: 16 + 140 per job reading a zip
+        let mut s = sched(&[100; 4], 24, 2 * 156);
+        s.fmt = Format::Trrntzip;
+        assert_eq!(workers(&mut s), Some(1));
+        assert_eq!(workers(&mut s), Some(1));
+        assert_eq!(workers(&mut s), None);
+        // alone, a job runs even if the budget is too small
+        let mut s = sched(&[100], 24, 0);
+        s.fmt = Format::Trrntzip;
         assert_eq!(workers(&mut s), Some(1));
     }
 

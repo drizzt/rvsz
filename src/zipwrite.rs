@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! RVZSTD zip writer, following RomVault `ZipFileData.cs`, `ZipExtraFieldWrite.cs`,
+//! RVZSTD and TorrentZip writer, following RomVault `ZipFileData.cs`, `ZipExtraFieldWrite.cs`,
 //! `ZipOpenWrite.cs` and `ZipEndOfCentralDir.cs`. The header builders are
 //! also used by the validator, which compares a file to what would be written.
 
@@ -14,19 +14,73 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 pub const METHOD_STORED: u16 = 0;
+pub const METHOD_DEFLATE: u16 = 8;
 pub const METHOD_ZSTD: u16 = 93;
 const MAX32: u64 = 0xFFFF_FFFF;
-pub const COMMENT_ID: &str = "RVZSTD-";
+
+/// Output structure: RomVault `ZipStructure.ZipZSTD` or `ZipTrrnt`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
+pub enum Format {
+    Rvzstd,
+    Trrntzip,
+}
+
+impl Format {
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::Rvzstd => "RVZSTD",
+            Format::Trrntzip => "TorrentZip",
+        }
+    }
+
+    /// Every TorrentZip entry is deflated, also empty ones (data `03 00`).
+    pub fn method(self, unc: u64) -> u16 {
+        match self {
+            Format::Rvzstd if unc == 0 => METHOD_STORED,
+            Format::Rvzstd => METHOD_ZSTD,
+            Format::Trrntzip => METHOD_DEFLATE,
+        }
+    }
+
+    /// Data of an empty entry: none for RVZSTD (stored), the deflate
+    /// stream `03 00` for TorrentZip (RomVault `LocalFileAddZeroLengthFile`).
+    pub fn empty_data(self) -> &'static [u8] {
+        match self {
+            Format::Rvzstd => &[],
+            Format::Trrntzip => &[3, 0],
+        }
+    }
+
+    /// DOS time and date as written: 0 for RVZSTD, 1996-12-24 23:32 for
+    /// TorrentZip (time 0xBC00, date 0x2198).
+    fn time_date(self) -> [u8; 4] {
+        match self {
+            Format::Rvzstd => [0; 4],
+            Format::Trrntzip => [0x00, 0xBC, 0x98, 0x21],
+        }
+    }
+
+    pub fn comment_id(self) -> &'static str {
+        match self {
+            Format::Rvzstd => "RVZSTD-",
+            Format::Trrntzip => "TORRENTZIPPED-",
+        }
+    }
+
+    /// Format named by the zip comment prefix, if any.
+    pub fn detect(comment: &[u8]) -> Option<Format> {
+        [Format::Rvzstd, Format::Trrntzip]
+            .into_iter()
+            .find(|f| comment.starts_with(f.comment_id().as_bytes()))
+    }
+}
 
 pub struct Meta<'a> {
+    pub fmt: Format,
     pub name: &'a str,
     pub unc: u64,
     pub comp: u64,
     pub crc: u32,
-}
-
-fn method(unc: u64) -> u16 {
-    if unc == 0 { METHOD_STORED } else { METHOD_ZSTD }
 }
 
 fn flags(utf8: bool) -> u16 {
@@ -53,7 +107,7 @@ pub fn local_header(m: &Meta, final_: bool) -> Vec<u8> {
     } else {
         pre64
     };
-    let meth = method(m.unc);
+    let meth = m.fmt.method(m.unc);
     // When only the compressed size overflows, RomVault fixes the header up
     // afterwards and forces version 45 (FixFileForZip64).
     let ver = if zip64 && !pre64 {
@@ -66,7 +120,7 @@ pub fn local_header(m: &Meta, final_: bool) -> Vec<u8> {
     h.extend_from_slice(&ver.to_le_bytes());
     h.extend_from_slice(&flags(utf8).to_le_bytes());
     h.extend_from_slice(&meth.to_le_bytes());
-    h.extend_from_slice(&[0, 0, 0, 0]); // time, date
+    h.extend_from_slice(&m.fmt.time_date());
     if final_ {
         h.extend_from_slice(&m.crc.to_le_bytes());
         let (c, u) = if zip64 {
@@ -107,14 +161,14 @@ pub fn central_header(m: &Meta, offset: u64) -> Vec<u8> {
     let c = field(m.comp);
     let o = field(offset);
     let zip64 = !extra.is_empty();
-    let meth = method(m.unc);
+    let meth = m.fmt.method(m.unc);
     let mut h = Vec::with_capacity(46 + name.len() + 28);
     h.extend_from_slice(&0x0201_4B50u32.to_le_bytes());
     h.extend_from_slice(&0u16.to_le_bytes()); // made by
     h.extend_from_slice(&version_needed(meth, zip64).to_le_bytes());
     h.extend_from_slice(&flags(utf8).to_le_bytes());
     h.extend_from_slice(&meth.to_le_bytes());
-    h.extend_from_slice(&[0, 0, 0, 0]);
+    h.extend_from_slice(&m.fmt.time_date());
     h.extend_from_slice(&m.crc.to_le_bytes());
     h.extend_from_slice(&c.to_le_bytes());
     h.extend_from_slice(&u.to_le_bytes());
@@ -132,10 +186,11 @@ pub fn central_header(m: &Meta, offset: u64) -> Vec<u8> {
     h
 }
 
-/// Zip64 records (if needed) and EOCD with the `RVZSTD-XXXXXXXX` comment.
-pub fn end_records(count: u64, cd_start: u64, cd: &[u8]) -> Vec<u8> {
+/// Zip64 records (if needed) and EOCD with the `RVZSTD-XXXXXXXX` or
+/// `TORRENTZIPPED-XXXXXXXX` comment.
+pub fn end_records(fmt: Format, count: u64, cd_start: u64, cd: &[u8]) -> Vec<u8> {
     let cd_size = cd.len() as u64;
-    let comment = format!("{COMMENT_ID}{:08X}", crc32fast::hash(cd));
+    let comment = format!("{}{:08X}", fmt.comment_id(), crc32fast::hash(cd));
     let mut h = Vec::new();
     if cd_start >= MAX32 || cd_size >= MAX32 || count >= 0xFFFF {
         let eocd64 = cd_start + cd_size;
@@ -265,6 +320,7 @@ pub fn create_temp(dest: &Path) -> io::Result<(File, PathBuf)> {
 }
 
 pub struct ZipWriter {
+    fmt: Format,
     w: BufWriter<File>,
     tmp: PathBuf,
     dest: PathBuf,
@@ -276,9 +332,10 @@ pub struct ZipWriter {
 
 impl ZipWriter {
     /// Writes to a temp file next to `dest`; `finish` renames it into place.
-    pub fn create(dest: &Path) -> io::Result<Self> {
+    pub fn create(dest: &Path, fmt: Format) -> io::Result<Self> {
         let (f, tmp) = create_temp(dest)?;
         Ok(ZipWriter {
+            fmt,
             w: BufWriter::with_capacity(1 << 20, f),
             tmp,
             dest: dest.to_path_buf(),
@@ -291,7 +348,8 @@ impl ZipWriter {
 
     /// Writes one entry. `body` gets a sink for compressed bytes and returns
     /// (uncompressed size, crc). For `unc == 0` (empty file or directory)
-    /// `body` is not called.
+    /// `body` is not called: RVZSTD stores no data, TorrentZip the 2 bytes
+    /// of an empty deflate stream.
     pub fn add(
         &mut self,
         name: &str,
@@ -301,6 +359,7 @@ impl ZipWriter {
         let offset = self.pos;
         let pre = local_header(
             &Meta {
+                fmt: self.fmt,
                 name,
                 unc,
                 comp: 0,
@@ -310,7 +369,9 @@ impl ZipWriter {
         );
         self.w.write_all(&pre)?;
         let (comp, crc) = if unc == 0 {
-            (0, 0)
+            let d = self.fmt.empty_data();
+            self.w.write_all(d)?;
+            (d.len() as u64, 0)
         } else {
             let mut c = Counter {
                 w: &mut self.w,
@@ -325,6 +386,7 @@ impl ZipWriter {
             (c.n, crc)
         };
         let m = Meta {
+            fmt: self.fmt,
             name,
             unc,
             comp,
@@ -353,7 +415,7 @@ impl ZipWriter {
     }
 
     pub fn finish(mut self) -> io::Result<()> {
-        let end = end_records(self.count, self.pos, &self.cd);
+        let end = end_records(self.fmt, self.count, self.pos, &self.cd);
         self.w.write_all(&std::mem::take(&mut self.cd))?;
         self.w.write_all(&end)?;
         self.w.flush()?;
@@ -406,5 +468,68 @@ mod tests {
         assert_eq!(fs::read(&victim).unwrap(), b"SECRET");
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
         untrack_temp(&tmp);
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    fn tz(unc: u64, comp: u64) -> Meta<'static> {
+        Meta {
+            fmt: Format::Trrntzip,
+            name: "a",
+            unc,
+            comp,
+            crc: 0x1234_5678,
+        }
+    }
+
+    #[test]
+    fn trrntzip_local_header() {
+        let h = local_header(&tz(5, 7), true);
+        let want: &[u8] = &[
+            0x50, 0x4B, 0x03, 0x04, 20, 0, 2, 0, 8, 0, 0x00, 0xBC, 0x98, 0x21, 0x78, 0x56, 0x34,
+            0x12, 7, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, b'a',
+        ];
+        assert_eq!(h, want);
+        // empty entries are deflated too
+        assert_eq!(&local_header(&tz(0, 2), true)[8..10], [8, 0]);
+        // unc needs zip64 from the start: version 45, extra with both sizes
+        let h = local_header(&tz(MAX32, MAX32 + 9), true);
+        assert_eq!(&h[4..6], [45, 0]);
+        assert_eq!(&h[18..26], [0xFF; 8]);
+        assert_eq!(&h[28..30], [20, 0]);
+        assert_eq!(&h[31..35], [1, 0, 16, 0]);
+        assert_eq!(&h[35..43], MAX32.to_le_bytes());
+        assert_eq!(&h[43..51], (MAX32 + 9).to_le_bytes());
+        // only comp overflows: placeholder has no extra, final one does
+        let m = tz(MAX32 - 1, MAX32);
+        assert_eq!(local_header(&m, false).len(), 31);
+        let h = local_header(&m, true);
+        assert_eq!((&h[4..6], h.len()), (&[45, 0][..], 51));
+    }
+
+    #[test]
+    fn trrntzip_central_and_end() {
+        let h = central_header(&tz(5, 7), 0);
+        assert_eq!(&h[4..8], [0, 0, 20, 0]);
+        assert_eq!(&h[10..16], [8, 0, 0x00, 0xBC, 0x98, 0x21]);
+        // only the offset needs zip64: version 45, extra holds the offset
+        let h = central_header(&tz(5, 7), MAX32);
+        assert_eq!(&h[6..8], [45, 0]);
+        assert_eq!(&h[30..32], [12, 0]);
+        assert_eq!(&h[47..59], [1, 0, 8, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0]);
+        let e = end_records(Format::Trrntzip, 1, 0, b"x");
+        let c = format!("TORRENTZIPPED-{:08X}", crc32fast::hash(b"x"));
+        assert_eq!(&e[20..22], (c.len() as u16).to_le_bytes());
+        assert_eq!(&e[22..], c.as_bytes());
+    }
+
+    #[test]
+    fn detect_by_comment() {
+        assert_eq!(Format::detect(b"RVZSTD-00000000"), Some(Format::Rvzstd));
+        assert_eq!(Format::detect(b"TORRENTZIPPED-0"), Some(Format::Trrntzip));
+        assert_eq!(Format::detect(b"TORRENT"), None);
     }
 }

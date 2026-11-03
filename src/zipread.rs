@@ -47,6 +47,8 @@ pub struct Archive {
     pub entries: Vec<Entry>,
     pub cd_start: u64,
     pub cd_size: u64,
+    /// EOCD comment (cut short if the file ends inside it).
+    pub comment: Vec<u8>,
 }
 
 /// Reads `len` bytes from `pos` with positional reads.
@@ -99,6 +101,8 @@ impl Archive {
         let Some(e) = eocd else {
             return bad("not a zip file (no end of central directory)");
         };
+        let clen = u16_at(&tail, e + 20) as usize;
+        let comment = tail[(e + 22).min(tail_len)..(e + 22 + clen).min(tail_len)].to_vec();
         let mut count = u16_at(&tail, e + 10) as u64;
         let mut cd_size = u32_at(&tail, e + 12) as u64;
         let mut cd_start = u32_at(&tail, e + 16) as u64;
@@ -180,6 +184,7 @@ impl Archive {
             entries,
             cd_start,
             cd_size,
+            comment,
         })
     }
 
@@ -225,7 +230,7 @@ impl Archive {
         let raw = BufReader::with_capacity(1 << 20, self.raw(i)?);
         Ok(match e.method {
             0 => Box::new(raw),
-            8 => Box::new(flate2::read::DeflateDecoder::new(raw)),
+            8 => Box::new(flate2::bufread::DeflateDecoder::new(raw)),
             93 | 20 => Box::new(rvzstd::Decoder::new(raw)?),
             m => return bad(format!("{}: unsupported compression method {m}", e.name)),
         })

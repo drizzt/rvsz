@@ -2,18 +2,19 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! RVZSTD validation. Covers RomVault's `ValidateStructure` checks (comment
-//! CRC, method rule, no `\`, CP437 vs bit 11, time 0, sort order, no redundant
-//! directories, data ends with `01 00 00`) and is stricter: every byte outside
+//! RVZSTD and TorrentZip validation. Covers RomVault's `ValidateStructure`
+//! checks (comment CRC, method rule, no `\`, CP437 vs bit 11, time and date,
+//! sort order, no redundant directories, RVZSTD data ends with `01 00 00`,
+//! TorrentZip empty entries are `03 00`) and is stricter: every byte outside
 //! the compressed data must equal what this tool writes. `deep` also
 //! decompresses, checks CRC and size, and re-encodes to compare the data.
 
+use crate::codec::Codec;
 use crate::progress::Bar;
-use crate::rvzstd::{Decoder, Encoder};
 use crate::sort::{dir_contains, tz_cmp, utf16};
 use crate::sys::FileExt;
 use crate::zipread::{Archive, pump};
-use crate::zipwrite::{Meta, central_header, end_records, local_header};
+use crate::zipwrite::{Format, Meta, central_header, end_records, local_header};
 use std::cmp::Ordering;
 use std::io::{self, Read, Write};
 
@@ -22,8 +23,10 @@ fn fail<T>(msg: impl Into<String>) -> Result<T, String> {
 }
 
 /// Ok(()) if valid, Err(reason) if not. I/O errors are reasons too.
-pub fn check(a: &Archive, deep: Option<(&mut Encoder, &Bar)>) -> Result<(), String> {
+/// `deep` needs a codec of format `fmt`.
+pub fn check(a: &Archive, fmt: Format, deep: Option<(&mut Codec, &Bar)>) -> Result<(), String> {
     let ents = &a.entries;
+    let fname = fmt.name();
     let mut pos = 0u64;
     let mut cd = Vec::new();
     for (i, e) in ents.iter().enumerate() {
@@ -34,13 +37,15 @@ pub fn check(a: &Archive, deep: Option<(&mut Encoder, &Bar)>) -> Result<(), Stri
         if e.offset != pos {
             return fail(format!("{n}: unexpected local header offset"));
         }
-        if e.unc == 0 && (e.comp != 0 || e.crc != 0) {
-            return fail(format!("{n}: empty entry with data"));
+        let empty = fmt.empty_data();
+        if e.unc == 0 && (e.comp != empty.len() as u64 || e.crc != 0) {
+            return fail(format!("{n}: bad empty entry"));
         }
-        if e.unc != 0 && e.comp < 3 {
+        if fmt == Format::Rvzstd && e.unc != 0 && e.comp < 3 {
             return fail(format!("{n}: compressed data too short"));
         }
         let m = Meta {
+            fmt,
             name: n,
             unc: e.unc,
             comp: e.comp,
@@ -49,13 +54,23 @@ pub fn check(a: &Archive, deep: Option<(&mut Encoder, &Bar)>) -> Result<(), Stri
         let want = local_header(&m, true);
         let got = a.local_header(i).map_err(|e| e.to_string())?;
         if got != want {
-            return fail(format!("{n}: local header differs from RVZSTD layout"));
+            return fail(format!("{n}: local header differs from {fname} layout"));
         }
         pos += want.len() as u64;
         let Some(data_end) = pos.checked_add(e.comp).filter(|&x| x <= a.len) else {
             return fail(format!("{n}: data out of range"));
         };
-        if e.unc != 0 {
+        if e.unc == 0 && !empty.is_empty() {
+            let mut data = vec![0u8; empty.len()];
+            a.file
+                .read_exact_at(&mut data, data_end - e.comp)
+                .map_err(|e| e.to_string())?;
+            if data != empty {
+                let hex: Vec<_> = empty.iter().map(|b| format!("{b:02X}")).collect();
+                return fail(format!("{n}: empty entry data is not {}", hex.join(" ")));
+            }
+        }
+        if fmt == Format::Rvzstd && e.unc != 0 {
             let mut tail = [0u8; 3];
             a.file
                 .read_exact_at(&mut tail, data_end - 3)
@@ -84,9 +99,9 @@ pub fn check(a: &Archive, deep: Option<(&mut Encoder, &Bar)>) -> Result<(), Stri
         .read_exact_at(&mut got, pos)
         .map_err(|e| e.to_string())?;
     if got != cd {
-        return fail("central directory differs from RVZSTD layout");
+        return fail(format!("central directory differs from {fname} layout"));
     }
-    let end = end_records(ents.len() as u64, pos, &cd);
+    let end = end_records(fmt, ents.len() as u64, pos, &cd);
     let mut got = vec![0u8; end.len()];
     pos += cd.len() as u64;
     if pos + end.len() as u64 != a.len {
@@ -96,7 +111,7 @@ pub fn check(a: &Archive, deep: Option<(&mut Encoder, &Bar)>) -> Result<(), Stri
         .read_exact_at(&mut got, pos)
         .map_err(|e| e.to_string())?;
     if got != end {
-        return fail("bad end of central directory or RVZSTD comment");
+        return fail(format!("bad end of central directory or {fname} comment"));
     }
     if let Some((enc, bar)) = deep {
         bar.set_total(ents.iter().map(|e| e.unc).sum());
@@ -128,15 +143,16 @@ impl<R: Read> Write for Cmp<R> {
     }
 }
 
-fn deep_entry(a: &Archive, i: usize, enc: &mut Encoder) -> io::Result<()> {
+fn deep_entry(a: &Archive, i: usize, enc: &mut Codec) -> io::Result<()> {
     let e = &a.entries[i];
+    // empty entries were checked byte for byte above
     if e.unc == 0 {
         return Ok(());
     }
-    let raw = a.raw(i)?;
-    let dec = Decoder::new(io::BufReader::with_capacity(1 << 20, raw.clone()))?;
+    // the headers matched `enc`'s format above, so open_entry picks its decoder
+    let dec = a.open_entry(i)?;
     let mut cmp = Cmp {
-        src: raw,
+        src: a.raw(i)?,
         buf: Vec::new(),
     };
     let r = (|| {

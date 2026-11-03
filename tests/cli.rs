@@ -120,6 +120,155 @@ fn pack_verbose_lists_entries() {
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("checking"));
 }
 
+fn tz_pack(src: &Path, z: &Path) -> std::process::Output {
+    bin()
+        .args(["pack", "--format", "trrntzip"])
+        .arg(src)
+        .arg("-o")
+        .arg(z)
+        .output()
+        .unwrap()
+}
+
+/// (offset, method, time, date, comp, name) of every local header.
+fn local_headers(b: &[u8]) -> Vec<(usize, u16, u16, u16, u32, Vec<u8>)> {
+    let u16_at = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let mut v = Vec::new();
+    let mut p = 0;
+    while b[p..].starts_with(b"PK\x03\x04") {
+        let comp = u32::from_le_bytes(b[p + 18..p + 22].try_into().unwrap());
+        let (n, x) = (u16_at(p + 26) as usize, u16_at(p + 28) as usize);
+        let name = b[p + 30..p + 30 + n].to_vec();
+        v.push((p, u16_at(p + 8), u16_at(p + 10), u16_at(p + 12), comp, name));
+        p += 30 + n + x + comp as usize;
+    }
+    v
+}
+
+#[test]
+fn trrntzip_pack_verify_extract() {
+    let t = tmp("trrntzip_pack");
+    let src = t.join("src");
+    corpus(&src);
+    let z = t.join("tz.zip");
+    assert!(tz_pack(&src, &z).status.success());
+    let b = fs::read(&z).unwrap();
+    let hs = local_headers(&b);
+    assert_eq!(hs.len(), 9);
+    for (p, method, time, date, comp, name) in &hs {
+        assert_eq!((*method, *time, *date), (8, 0xBC00, 0x2198));
+        if name == b"empty" || name.ends_with(b"/") {
+            assert_eq!(*comp, 2);
+            let d = p + 30 + name.len();
+            assert_eq!(&b[d..d + 2], [3, 0]);
+        }
+    }
+    // the non-CP437 name is UTF-8 with bit 11
+    let (p, ..) = hs
+        .iter()
+        .find(|h| h.5 == "\u{65E5}\u{672C}".as_bytes())
+        .unwrap();
+    assert_eq!(&b[p + 6..p + 8], &0x0802u16.to_le_bytes());
+    let eocd = find(&b, b"PK\x05\x06");
+    assert!(b[eocd + 22..].starts_with(b"TORRENTZIPPED-"));
+    assert!(ok(bin().args(["verify", "--deep"]).arg(&z)));
+    let x = t.join("x");
+    assert!(ok(bin().arg("extract").arg(&z).arg("-o").arg(&x)));
+    assert_eq!(files(&src), files(&x));
+
+    // already valid TorrentZip: skipped
+    let out = tz_pack(&z, &z);
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("skipped"));
+    // rewriting it as RVZSTD gives what packing the tree gives
+    let rv = t.join("rv.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&rv)));
+    let conv = t.join("conv.zip");
+    assert!(ok(bin().arg("pack").arg(&z).arg("-o").arg(&conv)));
+    assert_eq!(fs::read(&rv).unwrap(), fs::read(&conv).unwrap());
+    // and back: an RVZSTD zip is rewritten in place when TorrentZip is asked
+    let out = tz_pack(&conv, &conv);
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("packed"));
+    assert_eq!(b, fs::read(&conv).unwrap());
+    // an existing RVZSTD output of the tree is not taken as up to date
+    let out = tz_pack(&src, &rv);
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("packed"));
+    assert_eq!(b, fs::read(&rv).unwrap());
+}
+
+#[test]
+fn trrntzip_batch() {
+    let t = tmp("trrntzip_batch");
+    let src = t.join("src");
+    nested_tree(&src);
+    let out = t.join("out");
+    let run = || {
+        bin()
+            .args(["-j", "2", "batch", "--format", "trrntzip"])
+            .arg(&src)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .unwrap()
+    };
+    let o = run();
+    assert!(o.status.success());
+    assert_eq!(skipped(&o), 0);
+    let o = run();
+    assert!(o.status.success());
+    assert_eq!(skipped(&o), 2);
+}
+
+#[test]
+fn verify_rejects_trrntzip_mutations() {
+    let t = tmp("verify_rejects_tz");
+    let src = t.join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("a"), b"aaaa").unwrap();
+    fs::write(src.join("e"), b"").unwrap();
+    let z = t.join("good.zip");
+    assert!(tz_pack(&src, &z).status.success());
+    let good = fs::read(&z).unwrap();
+    let hs = local_headers(&good);
+    let e_data = hs[2].0 + 30 + 1;
+    let cd = find(&good, b"PK\x01\x02");
+
+    type Mutation = Box<dyn Fn(&mut Vec<u8>)>;
+    let mutations: Vec<(&str, &str, Mutation)> = vec![
+        ("local time", "TorrentZip", Box::new(|b| b[11] = 0)),
+        (
+            "central date",
+            "TorrentZip",
+            Box::new(move |b| b[cd + 14] = 0),
+        ),
+        (
+            "empty data",
+            "03 00",
+            Box::new(move |b| {
+                b[e_data] = 1;
+            }),
+        ),
+        (
+            "unknown comment",
+            "no RVZSTD or TorrentZip comment",
+            Box::new(|b| {
+                let e = find(b, b"PK\x05\x06");
+                b[e + 22] = b'X';
+            }),
+        ),
+    ];
+    for (what, msg, m) in mutations {
+        let mut b = good.clone();
+        m(&mut b);
+        fix_comment(&mut b);
+        let p = t.join("bad.zip");
+        fs::write(&p, &b).unwrap();
+        let out = bin().arg("verify").arg(&p).output().unwrap();
+        let so = String::from_utf8_lossy(&out.stdout);
+        assert!(!out.status.success(), "verify accepted mutation: {what}");
+        assert!(so.contains(msg), "{what}: {so}");
+    }
+}
+
 fn find(hay: &[u8], needle: &[u8]) -> usize {
     hay.windows(needle.len()).position(|w| w == needle).unwrap()
 }
@@ -549,6 +698,19 @@ fn zip64_compressed_size_only() {
     assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&z)));
     assert!(ok(bin().arg("verify").arg(&z)));
     let x = t.join("x");
+    assert!(ok(bin().arg("extract").arg(&z).arg("-o").arg(&x)));
+    assert_eq!(fs::metadata(x.join("big.bin")).unwrap().len(), 0xFFFF_FFFE);
+    fs::remove_dir_all(&x).unwrap();
+    fs::remove_file(&z).unwrap();
+    // deflate stored blocks also grow random data past 4 GiB
+    let z = t.join("tz.zip");
+    assert!(tz_pack(&src, &z).status.success());
+    assert!(ok(bin().arg("verify").arg(&z)));
+    let mut h = [0u8; 30];
+    std::io::Read::read_exact(&mut fs::File::open(&z).unwrap(), &mut h).unwrap();
+    assert_eq!(&h[4..6], &45u16.to_le_bytes());
+    assert_eq!(&h[8..10], &8u16.to_le_bytes());
+    assert_eq!(&h[28..30], &20u16.to_le_bytes());
     assert!(ok(bin().arg("extract").arg(&z).arg("-o").arg(&x)));
     assert_eq!(fs::metadata(x.join("big.bin")).unwrap().len(), 0xFFFF_FFFE);
     fs::remove_dir_all(&t).unwrap();

@@ -6,10 +6,12 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 
 # rvsz
 
-Standalone writer and checker for RomVault "RVZSTD" structured zips. Output
-is byte-identical to what RomVault writes: same entry order, headers, zstd
-frames (libzstd 1.5.5, level 19, multithreaded framing) and
-`RVZSTD-XXXXXXXX` comment.
+Standalone writer and checker for RomVault "RVZSTD" and TorrentZip
+structured zips. Output is byte-identical to what RomVault writes: same
+entry order, headers, compressed data and comment. RVZSTD uses zstd frames
+(libzstd 1.5.5, level 19, multithreaded framing) and the `RVZSTD-XXXXXXXX`
+comment; TorrentZip uses raw deflate (zlib 1.3.2, level 9), the fixed
+1996-12-24 23:32 timestamp and the `TORRENTZIPPED-XXXXXXXX` comment.
 
 ## Usage
 
@@ -19,16 +21,23 @@ rvsz pack <dir|zip>... [-o out]    dir -> <dir>.zip; zip is rewritten in place;
 rvsz batch <folder>... [-o outdir] rewrite every *.zip under each folder, recursively;
                                    with -o, all folders merge into outdir
 rvsz batch --pack-dirs <folder>... each subdir -> <name>.zip, top-level *.zip rewritten
-rvsz verify [--deep] <zip>...      exit 1 if any zip is not valid RVZSTD
+rvsz verify [--deep] <zip>...      exit 1 if any zip is not valid RVZSTD or
+                                   TorrentZip (picked by the zip comment)
 rvsz extract <zip> [-o dir]
 
+pack and batch options:
+  --format rvzstd|trrntzip  output format (default: rvzstd)
+
 global options:
-  -j N           total zstd worker threads (default: CPU count)
+  -j N           total zstd worker threads; with TorrentZip, zips packed
+                 at once (default: CPU count)
   --max-mem MiB  memory budget for encoders (default: 3/4 of MemAvailable)
   --force        rewrite even if the target is already valid
 ```
 
-A zip that is already valid RVZSTD is skipped. Otherwise the existing output
+A zip that is already valid in the output format is skipped (an RVZSTD zip
+is rewritten when `--format trrntzip` is asked, and the other way round).
+Otherwise the existing output
 (`<dir>.zip`, or the `-o` target of a zip) is skipped when it is valid and
 holds the same names, sizes and CRCs. `verify` checks every byte outside the compressed data against the
 layout this tool writes; `--deep` also decompresses, checks CRCs and
@@ -47,6 +56,11 @@ go to the next ones. A zip keeps its worker count until it is done (zstd cannot
 change it inside a frame). Peak memory is about
 135 MiB plus 130 MiB per worker thread; `--max-mem` lowers concurrency to fit.
 
+Deflate is single-threaded and much faster (about 70 MB/s per core for
+incompressible data), so with `--format trrntzip` each zip uses one thread
+and `-j N` packs N zips at once. A TorrentZip job needs only a few MiB, plus
+140 MiB when it reads a zstd zip.
+
 ## Build
 
 ```
@@ -64,12 +78,14 @@ a trailing dot or space).
 
 zstd-sys is pinned to `=2.0.9` (libzstd 1.5.5): a newer libzstd can produce
 different compressed bytes. RUSTSEC-2026-0410 affects only wasm32 builds.
+libz-sys is pinned to `=1.1.31` and built from its bundled zlib 1.3.2, whose
+level 9 output matches the managed zlib port RomVault uses for TorrentZip.
 
 ## Testing
 
 `cargo test` runs unit and CLI tests. `tools/oracle` is a C# program that
-writes RVZSTD zips with RomVault's own `Compress` library, as a reference
-for byte comparisons.
+writes RVZSTD or TorrentZip zips with RomVault's own `Compress` library, as a
+reference for byte comparisons.
 
 ## License
 

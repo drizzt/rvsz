@@ -79,8 +79,8 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      # Static Linux binaries: libzstd (C, from zstd-sys) is compiled with
-      # musl-gcc, set in .cargo/config.toml.
+      # Static Linux binaries: libzstd and zlib (C, from zstd-sys and libz-sys)
+      # are compiled with musl-gcc, set in .cargo/config.toml.
       - name: Install musl tools
         if: contains(matrix.target, 'linux-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools

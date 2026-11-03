@@ -2,9 +2,9 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-// Writes an RVZSTD zip from a directory using RomVault's own Compress
-// library, as a byte-for-byte reference for rvsz.
-// usage: Oracle <dir> <out.zip> [threads]
+// Writes an RVZSTD or TorrentZip zip from a directory using RomVault's own
+// Compress library, as a byte-for-byte reference for rvsz.
+// usage: Oracle <dir> <out.zip> [threads] [zstd|trrnt]
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -34,19 +34,25 @@ static class Program
     static int Main(string[] args)
     {
         int threads = args.Length > 2 ? int.Parse(args[2]) : 4;
+        ZipStructure st = (args.Length > 3 ? args[3] : "zstd") switch
+        {
+            "zstd" => ZipStructure.ZipZSTD,
+            "trrnt" => ZipStructure.ZipTrrnt,
+            string s => throw new ArgumentException("unknown structure " + s),
+        };
         var list = new List<(string name, string path)>();
         Walk(args[0], "", list);
         list.Sort((a, b) => Sorters.TrrntZipStringCompareCase(a.name, b.name));
 
         var zip = new StructuredZip();
-        ZipReturn zr = zip.ZipFileCreate(args[1], ZipStructure.ZipZSTD);
+        ZipReturn zr = zip.ZipFileCreate(args[1], st);
         if (zr != ZipReturn.ZipGood) { Console.Error.WriteLine("create: " + zr); return 1; }
         byte[] buf = new byte[1 << 20];
         foreach (var (name, path) in list)
         {
             ulong size = path == null ? 0 : (ulong)new FileInfo(path).Length;
             zr = zip.ZipFileOpenWriteStream(false, name, size,
-                StructuredArchive.GetCompressionType(ZipStructure.ZipZSTD, size), out Stream ws, null, threads);
+                StructuredArchive.GetCompressionType(st, size), out Stream ws, null, threads);
             if (zr != ZipReturn.ZipGood) { Console.Error.WriteLine(name + ": " + zr); return 1; }
             uint crc = 0;
             if (path != null)
