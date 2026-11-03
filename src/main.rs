@@ -290,6 +290,7 @@ fn human(n: u64) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pack(
     input: &Path,
     dest: &Path,
@@ -298,6 +299,7 @@ fn pack(
     verbose: bool,
     enc: &mut Codec,
     bar: &Bar,
+    started: &dyn Fn(),
 ) -> io::Result<Outcome> {
     let (src, list) = if input.is_dir() {
         // the output would be packed into itself by the next run
@@ -339,6 +341,7 @@ fn pack(
             return Ok(Outcome::Skipped);
         }
     }
+    started();
     write_zip(src, &list, dest, fmt, enc, verbose, bar)?;
     Ok(Outcome::Written)
 }
@@ -637,16 +640,21 @@ fn run_jobs(
                         let _release = Release(&sched, &freed, w, &job.src);
                         let name = job.dest.file_name().unwrap_or_default().to_string_lossy();
                         let bar = p.start(&name, job.size);
-                        if batch && !p.on() {
-                            // a big zip at level 19 can take an hour: show it started
-                            eprintln!(
-                                "{}{} ({w} workers)",
-                                color::word(true, SKY, "packing", 8),
-                                job.dest.display()
-                            );
-                        }
+                        let started = || {
+                            if batch && !p.on() {
+                                // a big zip at level 19 can take an hour: show it started
+                                eprintln!(
+                                    "{}{} ({w} worker{})",
+                                    color::word(true, SKY, "packing", 8),
+                                    job.dest.display(),
+                                    if w == 1 { "" } else { "s" }
+                                );
+                            }
+                        };
                         let r = Codec::new(fmt, w as u32).and_then(|mut enc| {
-                            pack(&job.src, &job.dest, fmt, force, verbose, &mut enc, &bar)
+                            pack(
+                                &job.src, &job.dest, fmt, force, verbose, &mut enc, &bar, &started,
+                            )
                         });
                         drop(bar);
                         match r {
