@@ -8,7 +8,7 @@
 use crate::sys::FileExt;
 use crate::{cp437, rvzstd};
 use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 
 fn bad<T>(msg: impl Into<String>) -> io::Result<T> {
@@ -228,13 +228,22 @@ impl Archive {
             return bad(format!("{}: encrypted entries are not supported", e.name));
         }
         let raw = BufReader::with_capacity(1 << 20, self.raw(i)?);
-        Ok(match e.method {
-            0 => Box::new(raw),
-            8 => Box::new(flate2::bufread::DeflateDecoder::new(raw)),
-            93 | 20 => Box::new(rvzstd::Decoder::new(raw)?),
-            m => return bad(format!("{}: unsupported compression method {m}", e.name)),
-        })
+        decoder(&e.name, e.method, raw)
     }
+}
+
+/// Decoder for the compressed data `raw` of entry `name`, zip method `method`.
+pub fn decoder<'a>(
+    name: &str,
+    method: u16,
+    raw: impl BufRead + 'a,
+) -> io::Result<Box<dyn Read + 'a>> {
+    Ok(match method {
+        0 => Box::new(raw),
+        8 => Box::new(flate2::bufread::DeflateDecoder::new(raw)),
+        93 | 20 => Box::new(rvzstd::Decoder::new(raw)?),
+        m => return bad(format!("{name}: unsupported compression method {m}")),
+    })
 }
 
 /// Reads `r` to the end, passing chunks to `f`; returns (size, crc32).

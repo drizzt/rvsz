@@ -420,6 +420,49 @@ impl ZipWriter {
         Ok(())
     }
 
+    /// Writes one entry whose compressed data is already in this format,
+    /// e.g. copied from an older zip of the same layout. `body` writes the
+    /// `comp` bytes and returns false if they turn out bad; the entry is
+    /// then taken back and false returned, so that `add` can write it.
+    /// The result is what `add` writes for the same data.
+    pub fn add_raw(
+        &mut self,
+        name: &str,
+        unc: u64,
+        crc: u32,
+        comp: u64,
+        body: impl FnOnce(&mut dyn Write) -> io::Result<bool>,
+    ) -> io::Result<bool> {
+        let offset = self.pos;
+        let m = Meta {
+            fmt: self.fmt,
+            name,
+            unc,
+            comp,
+            crc,
+        };
+        let h = local_header(&m, true);
+        self.w.write_all(&h)?;
+        let mut c = Counter {
+            w: &mut self.w,
+            n: 0,
+        };
+        let good = body(&mut c).map_err(|e| io::Error::other(format!("{name}: {e}")))?;
+        if c.n != comp {
+            return Err(io::Error::other(format!("{name}: short read from old zip")));
+        }
+        if !good {
+            self.w.flush()?;
+            self.w.get_ref().set_len(offset)?;
+            self.w.seek(io::SeekFrom::Start(offset))?;
+            return Ok(false);
+        }
+        self.pos = offset + h.len() as u64 + comp;
+        self.cd.extend_from_slice(&central_header(&m, offset));
+        self.count += 1;
+        Ok(true)
+    }
+
     pub fn finish(mut self) -> io::Result<()> {
         let end = end_records(self.fmt, self.count, self.pos, &self.cd);
         self.w.write_all(&std::mem::take(&mut self.cd))?;

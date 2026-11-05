@@ -20,7 +20,7 @@ use codec::Codec;
 use color::{GREEN, GREY, RED, SKY};
 use entries::{Entry, Source};
 use progress::{Bar, Progress};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -66,9 +66,14 @@ impl Resources {
 struct PackOpts {
     #[command(flatten)]
     res: Resources,
-    /// Rewrite even if the target is already valid in the output format
+    /// Rewrite even if the target is already valid in the output format,
+    /// and encode every entry (no copy from the existing output)
     #[arg(long)]
     force: bool,
+    /// Copy entries from the existing output without decoding them to
+    /// check their CRCs
+    #[arg(long)]
+    trust_existing: bool,
     /// Print each entry as it is packed (on stderr)
     #[arg(short, long)]
     verbose: bool,
@@ -190,26 +195,42 @@ fn open_source(p: &Path, size: u64) -> io::Result<File> {
     Ok(f)
 }
 
+/// An earlier output and, for each entry of the new list, the index of
+/// the old entry it can copy unchanged.
+type Reuse = (Archive, Vec<Option<usize>>);
+
+#[allow(clippy::too_many_arguments)]
 fn write_zip(
     input: Input,
+    old: Option<Reuse>,
     list: &[Entry],
     dest: &Path,
     fmt: Format,
     enc: &mut Codec,
-    verbose: bool,
+    opts: &PackOpts,
     bar: &Bar,
 ) -> io::Result<()> {
+    let verbose = opts.verbose;
     let mut w = ZipWriter::create(dest, fmt)?;
     // batch runs several zips at once: the prefix tells their lines apart
     let tag = dest.file_name().unwrap_or_default().to_string_lossy();
-    let total: u64 = list.iter().map(|e| e.size).sum();
-    bar.set_total(total);
+    let reused = |i: usize| old.as_ref().and_then(|(a, m)| m[i].map(|j| (a, j)));
+    // copied entries are decoded to check them, much faster than an
+    // encode: the bar counts them too, the summary only the encode work
+    bar.set_total(list.iter().map(|e| e.size).sum());
     enc.set_meter(bar.counter());
     if verbose {
+        let (copied, total) = list.iter().enumerate().fold((0, 0), |(c, t), (i, e)| {
+            if reused(i).is_some() {
+                (c + 1, t)
+            } else {
+                (c, t + e.size)
+            }
+        });
         bar.line(
             true,
             &format!(
-                "packing {}: {} entries, {}",
+                "packing {}: {} entries ({copied} copied), {} to encode",
                 dest.display(),
                 list.len(),
                 human(total)
@@ -217,18 +238,37 @@ fn write_zip(
         );
     }
     for (i, e) in list.iter().enumerate() {
-        if verbose {
+        let entry_line = |copied: bool| {
+            if verbose {
+                bar.line(
+                    true,
+                    &format!(
+                        "{tag} [{}/{}] {} ({}){}",
+                        i + 1,
+                        list.len(),
+                        e.name,
+                        human(e.size),
+                        if copied { " copied" } else { "" }
+                    ),
+                );
+            }
+        };
+        // a copied entry is printed once its check passed
+        if let Some((a, j)) = reused(i) {
+            if copy_entry(&mut w, &input, e, a, j, !opts.trust_existing)? {
+                enc.skip(e.size);
+                entry_line(true);
+                continue;
+            }
             bar.line(
                 true,
                 &format!(
-                    "{tag} [{}/{}] {} ({})",
-                    i + 1,
-                    list.len(),
-                    e.name,
-                    human(e.size)
+                    "{tag}: {}: bad data in the existing output, encoding it again",
+                    e.name
                 ),
             );
         }
+        entry_line(false);
         let r = w.add(&e.name, e.size, |sink| {
             let src = source_reader(&input, e)?;
             let (n, crc) = pump(src, e.size, |b| enc.write(b, sink))
@@ -251,35 +291,132 @@ fn write_zip(
             return Err(err);
         }
     }
-    // an in-place rewrite replaces the source zip: Windows refuses to
-    // rename over a file that is still open
+    // an in-place rewrite replaces the source zip, any rewrite the old
+    // output: Windows refuses to rename over a file that is still open
     drop(input);
+    drop(old);
     w.finish()
 }
 
-/// True if `zip` is valid in format `fmt` and holds exactly `list`: same
-/// names, sizes and CRCs (read from the files, or taken from the source zip).
-fn zip_matches(zip: &Path, fmt: Format, input: &Input, list: &[Entry]) -> io::Result<bool> {
-    let Ok(a) = Archive::open(zip) else {
-        return Ok(false);
+/// Copies entry `j` of the earlier output `a` as entry `e`. With `check`,
+/// the source zip entry (for a zip input) and the copied data are decoded
+/// first: false if the copied data is bad, and nothing written.
+fn copy_entry(
+    w: &mut ZipWriter,
+    input: &Input,
+    e: &Entry,
+    a: &Archive,
+    j: usize,
+    check: bool,
+) -> io::Result<bool> {
+    let z = &a.entries[j];
+    if check
+        && let Source::Zip(_, want) = e.src
+        && pump(source_reader(input, e)?, e.size, |_| Ok(()))
+            .map_err(|err| io::Error::other(format!("{}: {err}", e.name)))?
+            .1
+            != want
+    {
+        return Err(io::Error::other(format!(
+            "{}: CRC error in source zip",
+            e.name
+        )));
+    }
+    w.add_raw(&e.name, z.unc, z.crc, z.comp, |sink| {
+        let mut raw = a.raw(j)?;
+        if !check {
+            io::copy(&mut raw, sink)?;
+            return Ok(true);
+        }
+        copy_checked(&e.name, z, &mut raw, sink)
+    })
+}
+
+/// Copies the compressed data of `z` from `raw` to `sink` and decodes it on
+/// the way. False if it does not decode to `z.unc` bytes with CRC `z.crc`.
+fn copy_checked(
+    name: &str,
+    z: &zipread::Entry,
+    raw: &mut impl Read,
+    sink: &mut dyn io::Write,
+) -> io::Result<bool> {
+    /// Passes on to `sink` every byte read from `src`. Keeps the first I/O
+    /// error, which the decoder would report as bad data.
+    struct Tee<'a, R> {
+        src: &'a mut R,
+        sink: &'a mut dyn io::Write,
+        err: Option<io::Error>,
+    }
+    impl<R: Read> Read for Tee<'_, R> {
+        fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+            let r = self
+                .src
+                .read(b)
+                .and_then(|n| self.sink.write_all(&b[..n]).map(|()| n));
+            if let Err(e) = &r
+                && self.err.is_none()
+            {
+                self.err = Some(io::Error::new(e.kind(), e.to_string()));
+            }
+            r
+        }
+    }
+    let mut tee = Tee {
+        src: raw,
+        sink,
+        err: None,
     };
-    if validate::check(&a, fmt, None).is_err() || a.entries.len() != list.len() {
-        return Ok(false);
+    let got = zipread::decoder(
+        name,
+        z.method,
+        io::BufReader::with_capacity(1 << 20, &mut tee),
+    )
+    .and_then(|d| pump(d, z.unc, |_| Ok(())));
+    if let Some(e) = tee.err.take() {
+        return Err(e);
     }
-    for (z, e) in a.entries.iter().zip(list) {
-        if z.name != e.name || z.unc != e.size {
-            return Ok(false);
-        }
-        let crc = match e.src {
-            Source::File(_) => pump(source_reader(input, e)?, e.size, |_| Ok(()))?.1,
-            Source::Zip(_, crc) => crc,
-            Source::Dir => continue,
+    // a decoder may stop before the end of bad data: copy the rest too
+    io::copy(&mut tee, &mut io::sink())?;
+    Ok(matches!(got, Ok((n, crc)) if n == z.unc && crc == z.crc))
+}
+
+/// Entries of `zip` (an earlier output) that `list` can copy unchanged:
+/// for each entry of `list`, the index of the entry of `zip` with the same
+/// name, size and CRC (read from the files, or taken from the source zip).
+/// None if `zip` is not valid in format `fmt`, as its compressed data may
+/// then differ from what this tool writes.
+fn reusable(zip: &Path, fmt: Format, input: &Input, list: &[Entry]) -> io::Result<Option<Reuse>> {
+    let Ok(a) = Archive::open(zip) else {
+        return Ok(None);
+    };
+    if validate::check(&a, fmt, None).is_err() {
+        return Ok(None);
+    }
+    let by_name: HashMap<&str, usize> = a
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(i, z)| (z.name.as_str(), i))
+        .collect();
+    let mut map = Vec::with_capacity(list.len());
+    for e in list {
+        let hit = match by_name.get(e.name.as_str()) {
+            Some(&j) if a.entries[j].unc == e.size => {
+                let crc = a.entries[j].crc;
+                let same = match e.src {
+                    Source::File(_) => {
+                        pump(source_reader(input, e)?, e.size, |_| Ok(()))? == (e.size, crc)
+                    }
+                    Source::Zip(_, c) => c == crc,
+                    Source::Dir => true,
+                };
+                same.then_some(j)
+            }
+            _ => None,
         };
-        if crc != z.crc {
-            return Ok(false);
-        }
+        map.push(hit);
     }
-    Ok(true)
+    Ok(Some((a, map)))
 }
 
 fn human(n: u64) -> String {
@@ -295,12 +432,12 @@ fn pack(
     input: &Path,
     dest: &Path,
     fmt: Format,
-    force: bool,
-    verbose: bool,
+    opts: &PackOpts,
     enc: &mut Codec,
     bar: &Bar,
     started: &dyn Fn(),
 ) -> io::Result<Outcome> {
+    let (force, verbose) = (opts.force, opts.verbose);
     let (src, list) = if input.is_dir() {
         // the output would be packed into itself by the next run
         let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
@@ -324,10 +461,13 @@ fn pack(
         let list = entries::from_zip(&a)?;
         (Input::Zip(a), list)
     };
-    // an output from an earlier run (e.g. `batch -o`) needs no new encode
+    // an output from an earlier run (e.g. `batch -o`) needs no new encode,
+    // or only for the entries that changed
+    let mut old = None;
     if !force && dest.exists() {
         if verbose {
-            // reads every source file to compare CRCs
+            // reads each source file whose name and size match an old
+            // entry, to compare CRCs
             bar.line(
                 true,
                 &format!(
@@ -337,12 +477,15 @@ fn pack(
                 ),
             );
         }
-        if zip_matches(dest, fmt, &src, &list)? {
-            return Ok(Outcome::Skipped);
+        if let Some((a, map)) = reusable(dest, fmt, &src, &list)? {
+            if a.entries.len() == list.len() && map.iter().all(Option::is_some) {
+                return Ok(Outcome::Skipped);
+            }
+            old = Some((a, map));
         }
     }
     started();
-    write_zip(src, &list, dest, fmt, enc, verbose, bar)?;
+    write_zip(src, old, &list, dest, fmt, enc, opts, bar)?;
     Ok(Outcome::Written)
 }
 
@@ -506,6 +649,9 @@ struct Job {
     src: PathBuf,
     dest: PathBuf,
     size: u64,
+    /// Needs a zstd decoder: reads a source zip, or checks entries copied
+    /// from the existing output. Set by `run_jobs`.
+    decode: bool,
 }
 
 fn tree_size(p: &Path) -> u64 {
@@ -536,12 +682,12 @@ struct Sched {
 }
 
 impl Sched {
-    fn job_mem(&self, w: usize, src: &Path) -> u64 {
+    fn job_mem(&self, w: usize, decode: bool) -> u64 {
         let enc = match self.fmt {
             Format::Rvzstd => encoder_mem_mib(w),
             Format::Trrntzip => DEFLATE_MEM_MIB,
         };
-        enc + if src.is_dir() { 0 } else { decoder_mem_mib() }
+        enc + if decode { decoder_mem_mib() } else { 0 }
     }
 
     /// Next job and its workers, or None if the queue is empty. Some(None):
@@ -552,11 +698,11 @@ impl Sched {
             Format::Trrntzip => {
                 // alone: run even if the budget is too small, as `pack` does
                 let fits =
-                    self.running == 0 || self.used + self.job_mem(1, &job.src) <= self.budget;
+                    self.running == 0 || self.used + self.job_mem(1, job.decode) <= self.budget;
                 if fits { self.free.min(1) } else { 0 }
             }
             Format::Rvzstd => {
-                let dec = self.job_mem(0, &job.src) - encoder_mem_mib(0);
+                let dec = self.job_mem(0, job.decode) - encoder_mem_mib(0);
                 if self.running == 0 {
                     // alone: run even if the budget is too small, as `pack` does
                     fit_workers(self.free, self.budget.saturating_sub(dec))
@@ -577,14 +723,14 @@ impl Sched {
         let job = self.jobs.pop()?;
         self.free -= w;
         self.left -= job.size;
-        self.used += self.job_mem(w, &job.src);
+        self.used += self.job_mem(w, job.decode);
         self.running += 1;
         Some(Some((job, w)))
     }
 
-    fn release(&mut self, w: usize, src: &Path) {
+    fn release(&mut self, w: usize, decode: bool) {
         self.free += w;
-        self.used -= self.job_mem(w, src);
+        self.used -= self.job_mem(w, decode);
         self.running -= 1;
     }
 }
@@ -594,10 +740,14 @@ fn run_jobs(
     fmt: Format,
     total: usize,
     budget: u64,
-    force: bool,
-    verbose: bool,
+    opts: &PackOpts,
     batch: bool,
 ) -> bool {
+    for j in &mut jobs {
+        // the dest check is made once here: the job creates dest, and the
+        // scheduler must give back the same memory it took
+        j.decode = !j.src.is_dir() || (!opts.trust_existing && !opts.force && j.dest.exists());
+    }
     jobs.sort_by_key(|j| j.size);
     let threads = total.clamp(1, jobs.len().max(1));
     let left = jobs.iter().map(|j| j.size).sum();
@@ -629,7 +779,7 @@ fn run_jobs(
                         drop(st);
                         // gives back the workers even if `pack` panics, else the
                         // other threads would wait on `freed` forever
-                        struct Release<'a>(&'a Mutex<Sched>, &'a Condvar, usize, &'a Path);
+                        struct Release<'a>(&'a Mutex<Sched>, &'a Condvar, usize, bool);
                         impl Drop for Release<'_> {
                             fn drop(&mut self) {
                                 let mut st = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -637,7 +787,7 @@ fn run_jobs(
                                 self.1.notify_all();
                             }
                         }
-                        let _release = Release(&sched, &freed, w, &job.src);
+                        let _release = Release(&sched, &freed, w, job.decode);
                         let name = job.dest.file_name().unwrap_or_default().to_string_lossy();
                         let bar = p.start(&name, job.size);
                         let started = || {
@@ -652,9 +802,7 @@ fn run_jobs(
                             }
                         };
                         let r = Codec::new(fmt, w as u32).and_then(|mut enc| {
-                            pack(
-                                &job.src, &job.dest, fmt, force, verbose, &mut enc, &bar, &started,
-                            )
+                            pack(&job.src, &job.dest, fmt, opts, &mut enc, &bar, &started)
                         });
                         drop(bar);
                         match r {
@@ -820,16 +968,9 @@ fn main() {
                 size: 1,
                 src: input,
                 dest,
+                decode: false,
             };
-            run_jobs(
-                vec![job],
-                format,
-                total,
-                mem,
-                opts.force,
-                opts.verbose,
-                false,
-            )
+            run_jobs(vec![job], format, total, mem, &opts, false)
         }
         Cmd::Pack {
             inputs,
@@ -864,9 +1005,10 @@ fn main() {
                             size: tree_size(&src),
                             src,
                             dest,
+                            decode: false,
                         })
                         .collect();
-                    run_jobs(jobs, format, total, mem, opts.force, opts.verbose, true)
+                    run_jobs(jobs, format, total, mem, &opts, true)
                 }
                 Err(e) => {
                     eprintln!("{}{e}", err_word());
@@ -905,9 +1047,10 @@ fn main() {
                             size: tree_size(&src),
                             src,
                             dest,
+                            decode: false,
                         })
                         .collect();
-                    run_jobs(jobs, format, total, mem, opts.force, opts.verbose, true)
+                    run_jobs(jobs, format, total, mem, &opts, true)
                 }
                 Err(e) => {
                     eprintln!("{}{e}", err_word());
@@ -1008,6 +1151,7 @@ mod tests {
                 src: PathBuf::from("a.zip"),
                 dest: PathBuf::from("b.zip"),
                 size,
+                decode: true,
             })
             .collect();
         jobs.sort_by_key(|j| j.size);
@@ -1040,7 +1184,7 @@ mod tests {
         assert_eq!(workers(&mut s), Some(1));
         assert_eq!(workers(&mut s), None);
         // workers given back go to the jobs still queued
-        s.release(23, Path::new("a.zip"));
+        s.release(23, true);
         assert_eq!(workers(&mut s), Some(6));
         // memory: a job costs 150 + 130 per worker + 140, the first takes the
         // 4 workers that fit, the next waits until it ends
@@ -1066,7 +1210,7 @@ mod tests {
             assert_eq!(workers(&mut s), Some(1));
         }
         assert_eq!(workers(&mut s), None);
-        s.release(1, Path::new("a.zip"));
+        s.release(1, true);
         assert_eq!(workers(&mut s), Some(1));
         // memory: 16 + 140 per job reading a zip
         let mut s = sched(&[100; 4], 24, 2 * 156);

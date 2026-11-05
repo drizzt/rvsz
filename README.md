@@ -34,14 +34,24 @@ global options:
   -j N           total zstd worker threads; with TorrentZip, zips packed
                  at once (default: CPU count)
   --max-mem MiB  memory budget for encoders (default: 3/4 of MemAvailable)
-  --force        rewrite even if the target is already valid
+  --force        rewrite even if the target is already valid, and encode
+                 every entry (no copy from the existing output)
+  --trust-existing  copy entries from the existing output without
+                 decoding them to check their CRCs
 ```
 
 A zip that is already valid in the output format is skipped (an RVZSTD zip
 is rewritten when `--format trrntzip` is asked, and the other way round).
 Otherwise the existing output
 (`<dir>.zip`, or the `-o` target of a zip) is skipped when it is valid and
-holds the same names, sizes and CRCs. `verify` checks every byte outside the compressed data against the
+holds the same names, sizes and CRCs. If only some entries differ (files
+added, removed or changed), the unchanged ones are copied from it as they
+are and only the rest is encoded; the result is the same bytes as a full
+repack. Each copied entry is decoded on the way and its CRC checked (also
+in the source zip, for a zip input): a bad one in the existing output is
+encoded again, a bad one in the source zip is an error, as in a full
+repack. `--trust-existing` skips these checks and copies the data as it is.
+`--force` encodes every entry again. `verify` checks every byte outside the compressed data against the
 layout this tool writes; `--deep` also decompresses, checks CRCs and
 re-encodes each entry to compare the compressed bytes.
 

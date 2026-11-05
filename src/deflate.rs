@@ -149,6 +149,15 @@ impl Deflater {
         self.base = 0;
     }
 
+    /// Counts `n` input bytes as done without encoding them (an entry
+    /// copied from an older zip).
+    pub fn skip(&mut self, n: u64) {
+        self.base += n;
+        if let Some(m) = &self.meter {
+            m.store(self.base, Ordering::Relaxed);
+        }
+    }
+
     /// Ends the stream and resets it for the next entry.
     pub fn finish(&mut self, sink: &mut dyn Write) -> io::Result<()> {
         self.strm.next_in = std::ptr::null_mut();

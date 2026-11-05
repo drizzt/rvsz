@@ -123,14 +123,176 @@ fn pack_verbose_lists_entries() {
     assert!(String::from_utf8_lossy(&out.stderr).starts_with("checking"));
 }
 
-fn tz_pack(src: &Path, z: &Path) -> std::process::Output {
-    bin()
-        .args(["pack", "--format", "trrntzip"])
+/// Packs `src` over the zip from an earlier run of `src` and, as a full
+/// encode, to a fresh path: both must be the same bytes. Returns the
+/// verbose output of the run over the old zip.
+fn repack_matches_full(src: &Path, z: &Path, fmt: &str) -> String {
+    let out = bin()
+        .args(["pack", "-v", "--format", fmt])
         .arg(src)
         .arg("-o")
         .arg(z)
         .output()
-        .unwrap()
+        .unwrap();
+    assert!(out.status.success());
+    let full = z.with_extension("full.zip");
+    assert!(ok(&mut pack_cmd(fmt, src, &full)));
+    assert_eq!(fs::read(z).unwrap(), fs::read(&full).unwrap());
+    fs::remove_file(&full).unwrap();
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn repack_copies_unchanged_entries() {
+    for fmt in ["rvzstd", "trrntzip"] {
+        let t = tmp(&format!("repack_{fmt}"));
+        let src = t.join("src");
+        corpus(&src);
+        let z = t.join("o.zip");
+        assert!(ok(&mut pack_cmd(fmt, &src, &z)));
+        // new files at the start, middle and end of the sort order
+        fs::write(src.join("0first"), b"new").unwrap();
+        fs::write(src.join("m"), b"new").unwrap();
+        fs::write(src.join("zz"), b"new").unwrap();
+        let err = repack_matches_full(&src, &z, fmt);
+        assert!(
+            err.contains(": 12 entries (9 copied), 9 bytes to encode"),
+            "{err}"
+        );
+        assert!(err.contains("] big (11.4 MiB) copied"), "{err}");
+        assert!(err.contains("] m (3 bytes)\n"), "{err}");
+        // edited (same size and other size), deleted, renamed
+        fs::write(src.join("m"), b"NEW").unwrap();
+        fs::write(src.join("B"), b"longer").unwrap();
+        fs::remove_file(src.join("zz")).unwrap();
+        fs::rename(src.join("_x"), src.join("_y")).unwrap();
+        let err = repack_matches_full(&src, &z, fmt);
+        assert!(err.contains("] m (3 bytes)\n"), "{err}");
+        assert!(err.contains("] big (11.4 MiB) copied"), "{err}");
+        assert!(err.contains("] empty (0 bytes) copied"), "{err}");
+        assert!(err.contains("] emptydir/ (0 bytes) copied"), "{err}");
+        assert!(err.contains("] \u{65E5}\u{672C} (1 bytes) copied"), "{err}");
+        // a file in the empty dir drops its dir entry; deleting all
+        // but one file still writes a zip
+        fs::write(src.join("emptydir/f"), b"x").unwrap();
+        repack_matches_full(&src, &z, fmt);
+        fs::remove_dir_all(&src).unwrap();
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("empty"), b"").unwrap();
+        repack_matches_full(&src, &z, fmt);
+        assert!(ok(bin().args(["verify", "--deep"]).arg(&z)));
+        // unchanged: skipped, nothing written
+        let out = pack_cmd(fmt, &src, &z).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("skipped"));
+    }
+}
+
+/// An earlier output in the other format, or `--force`, copies nothing:
+/// zstd data must never end up in a TorrentZip.
+#[test]
+fn repack_no_copy_other_format_or_force() {
+    let t = tmp("repack_no_copy");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a"), b"aaaa").unwrap();
+    let z = t.join("o.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&z)));
+    fs::write(src.join("b"), b"b").unwrap();
+    let err = repack_matches_full(&src, &z, "trrntzip");
+    assert!(
+        err.contains(": 2 entries (0 copied), 5 bytes to encode"),
+        "{err}"
+    );
+    fs::write(src.join("c"), b"c").unwrap();
+    let out = bin()
+        .args(["pack", "-v", "--force", "--format", "trrntzip"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&z)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains(": 3 entries (0 copied), 6 bytes to encode"),
+        "{err}"
+    );
+}
+
+/// Flips one byte in the middle of the compressed data of entry `name`.
+fn corrupt_entry(z: &Path, name: &str) {
+    let mut b = fs::read(z).unwrap();
+    let (off, _, _, _, comp, _) = local_headers(&b)
+        .into_iter()
+        .find(|h| h.5 == name.as_bytes())
+        .unwrap();
+    let extra = u16::from_le_bytes([b[off + 28], b[off + 29]]) as usize;
+    b[off + 30 + name.len() + extra + comp as usize / 2] ^= 0x55;
+    fs::write(z, b).unwrap();
+}
+
+/// Bad data in the existing output is not copied: the entry is encoded
+/// again, unless `--trust-existing` is given.
+#[test]
+fn repack_reencodes_bad_old_entry() {
+    for fmt in ["rvzstd", "trrntzip"] {
+        let t = tmp(&format!("repack_bad_old_{fmt}"));
+        let src = t.join("src");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a"), b"some text that is not too short").unwrap();
+        let z = t.join("o.zip");
+        assert!(ok(&mut pack_cmd(fmt, &src, &z)));
+        corrupt_entry(&z, "a");
+        fs::write(src.join("b"), b"b").unwrap();
+        let err = repack_matches_full(&src, &z, fmt);
+        assert!(
+            err.contains("o.zip: a: bad data in the existing output, encoding it again"),
+            "{err}"
+        );
+        assert!(err.contains("] a (31 bytes)\n"), "{err}");
+        corrupt_entry(&z, "a");
+        let bad = fs::read(&z).unwrap();
+        fs::write(src.join("c"), b"c").unwrap();
+        assert!(ok(pack_cmd(fmt, &src, &z).arg("--trust-existing")));
+        // the corrupt entry is still first, copied as it was
+        let new = fs::read(&z).unwrap();
+        let (_, _, _, _, comp, _) = local_headers(&new)[0].clone();
+        let n = 30 + 1 + comp as usize;
+        assert_eq!(new[..n], bad[..n]);
+        assert!(!ok(bin().args(["verify", "--deep"]).arg(&z)));
+    }
+}
+
+/// A copied entry is checked in the source zip too: a corrupt one fails as
+/// in a full repack, even if its recorded CRC matches the existing output.
+#[test]
+fn repack_checks_source_zip_entry() {
+    let t = tmp("repack_bad_src");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a"), b"some text that is not too short").unwrap();
+    let z = t.join("o.zip");
+    assert!(ok(&mut pack_cmd("trrntzip", &src, &z)));
+    fs::write(src.join("b"), b"b").unwrap();
+    let input = t.join("in.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&input)));
+    corrupt_entry(&input, "a");
+    let out = pack_cmd("trrntzip", &input, &z).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("a: CRC error in source zip"), "{err}");
+    assert!(ok(pack_cmd("trrntzip", &input, &z).arg("--trust-existing")));
+}
+
+/// `pack --format <fmt> <src> -o <z>`.
+fn pack_cmd(fmt: &str, src: &Path, z: &Path) -> Command {
+    let mut c = bin();
+    c.args(["pack", "--format", fmt]).arg(src).arg("-o").arg(z);
+    c
+}
+
+fn tz_pack(src: &Path, z: &Path) -> std::process::Output {
+    pack_cmd("trrntzip", src, z).output().unwrap()
 }
 
 /// (offset, method, time, date, comp, name) of every local header.
@@ -727,6 +889,21 @@ fn zip64_compressed_size_only() {
     assert!(ok(bin().arg("extract").arg(&z).arg("-o").arg(&x)));
     assert_eq!(fs::metadata(x.join("big.bin")).unwrap().len(), 0xFFFF_FFFE);
     fs::remove_dir_all(&x).unwrap();
+    // a new small file: the zip64 entry is copied, its data moved up 20
+    // bytes as written. "copied" is printed only once the data decoded to
+    // the right CRC, so a plain verify of the layout is enough
+    fs::write(src.join("a"), b"small").unwrap();
+    let out = bin()
+        .args(["pack", "-v"])
+        .arg(&src)
+        .arg("-o")
+        .arg(&z)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("big.bin (4096.0 MiB) copied"));
+    assert!(ok(bin().arg("verify").arg(&z)));
+    fs::remove_file(src.join("a")).unwrap();
     fs::remove_file(&z).unwrap();
     // deflate stored blocks also grow random data past 4 GiB
     let z = t.join("tz.zip");

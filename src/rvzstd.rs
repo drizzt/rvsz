@@ -127,6 +127,15 @@ impl Encoder {
         self.base = 0;
     }
 
+    /// Counts `n` input bytes as done without encoding them (an entry
+    /// copied from an older zip).
+    pub fn skip(&mut self, n: u64) {
+        self.base += n;
+        if let Some(m) = &self.meter {
+            m.store(self.base, Ordering::Relaxed);
+        }
+    }
+
     pub fn write(&mut self, data: &[u8], sink: &mut dyn Write) -> io::Result<()> {
         self.run(data, z::ZSTD_EndDirective::ZSTD_e_continue, sink)
     }

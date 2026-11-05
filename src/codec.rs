@@ -32,6 +32,13 @@ impl Codec {
         }
     }
 
+    pub fn skip(&mut self, n: u64) {
+        match self {
+            Codec::Zstd(e) => e.skip(n),
+            Codec::Deflate(d) => d.skip(n),
+        }
+    }
+
     pub fn write(&mut self, data: &[u8], sink: &mut dyn Write) -> io::Result<()> {
         match self {
             Codec::Zstd(e) => e.write(data, sink),
