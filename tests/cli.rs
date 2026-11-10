@@ -773,6 +773,49 @@ fn batch_recursive() {
 }
 
 #[test]
+fn batch_skips_dsm_folders() {
+    let dsm = ["@eaDir", "#recycle", "#snapshot"];
+    for pack_dirs in [false, true] {
+        let t = tmp(if pack_dirs {
+            "batch_dsm_dirs"
+        } else {
+            "batch_dsm"
+        });
+        fs::create_dir_all(t.join("game/@eaDir")).unwrap();
+        fs::write(t.join("game/rom"), b"rom").unwrap();
+        deflate_zip(&t.join("top.zip"), &[("h", b"three")]);
+        // at the top, and one level down for the recursive scan
+        let old: Vec<PathBuf> = dsm
+            .iter()
+            .map(|d| t.join(d))
+            .chain([t.join("game/@eaDir")])
+            .map(|d| {
+                fs::create_dir_all(&d).unwrap();
+                d.join("old.zip")
+            })
+            .collect();
+        for z in &old {
+            deflate_zip(z, &[("g", b"two")]);
+        }
+        let before = fs::read(&old[0]).unwrap();
+        let mut c = bin();
+        c.arg("batch");
+        if pack_dirs {
+            c.arg("--pack-dirs");
+        }
+        assert!(ok(c.arg(&t)));
+        assert!(ok(bin().arg("verify").arg(t.join("top.zip"))));
+        assert_eq!(t.join("game.zip").exists(), pack_dirs);
+        for d in dsm {
+            assert!(!t.join(format!("{d}.zip")).exists());
+        }
+        for z in &old {
+            assert_eq!(fs::read(z).unwrap(), before, "{}", z.display());
+        }
+    }
+}
+
+#[test]
 fn batch_recursive_outdir() {
     let t = tmp("batch_rec_outdir");
     let src = t.join("src");

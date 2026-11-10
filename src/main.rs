@@ -580,7 +580,7 @@ fn batch_jobs(folder: &Path, outdir: &Path) -> io::Result<Vec<(PathBuf, PathBuf)
         // kept as OsString: a lossy name would point the job at another file
         let fname = d.file_name();
         let b = fname.as_encoded_bytes();
-        if b.starts_with(b".") {
+        if batch_skips(b) {
             continue;
         }
         let ft = d.file_type()?;
@@ -670,6 +670,14 @@ fn ignores_case(dir: &Path) -> io::Result<bool> {
     Ok(r.is_ok())
 }
 
+/// True for a name that `batch` leaves alone: a dot name, or one of the
+/// folders Synology DSM keeps inside shared folders for itself (thumbnails
+/// and indexes, the recycle bin, snapshots). A zip in there is not part of
+/// the user's set, and `--pack-dirs` would write `@eaDir.zip`.
+fn batch_skips(name: &[u8]) -> bool {
+    name.starts_with(b".") || [&b"@eaDir"[..], b"#recycle", b"#snapshot"].contains(&name)
+}
+
 fn is_zip_name(b: &[u8]) -> bool {
     b.len() >= 4 && b[b.len() - 4..].eq_ignore_ascii_case(b".zip")
 }
@@ -689,7 +697,7 @@ fn zip_jobs(
         let p = d.path();
         let fname = d.file_name();
         let b = fname.as_encoded_bytes();
-        if b.starts_with(b".") {
+        if batch_skips(b) {
             continue;
         }
         let ft = d.file_type()?;
