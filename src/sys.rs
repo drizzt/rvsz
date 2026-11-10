@@ -154,7 +154,10 @@ mod unix {
         let mut sigs = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP]) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("warning: no signal handler, temp files may be left: {e}");
+                crate::progress::print_line(
+                    true,
+                    &format!("warning: no signal handler, temp files may be left: {e}"),
+                );
                 return;
             }
         };
@@ -360,9 +363,12 @@ mod windows {
         }
         // SAFETY: handler is a valid function for the whole process life
         if unsafe { SetConsoleCtrlHandler(Some(handler), 1) } == 0 {
-            eprintln!(
-                "warning: no signal handler, temp files may be left: {}",
-                io::Error::last_os_error()
+            crate::progress::print_line(
+                true,
+                &format!(
+                    "warning: no signal handler, temp files may be left: {}",
+                    io::Error::last_os_error()
+                ),
             );
         }
     }

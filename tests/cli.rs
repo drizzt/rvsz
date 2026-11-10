@@ -987,6 +987,46 @@ fn sigint_removes_temp_file() {
     assert_eq!(list(), 0);
 }
 
+/// A reader that goes away (`rvsz verify ... | head -n 1`) ends the run with
+/// status 1: no panic, and no temp file left.
+#[test]
+fn closed_pipe_ends_run() {
+    let t = tmp("closed_pipe");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("f"), b"x").unwrap();
+    let z = t.join("z.zip");
+    assert!(ok(bin().arg("pack").arg(&src).arg("-o").arg(&z)));
+    let closed = || {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        writer
+    };
+    // stdout: the status line of verify
+    let out = bin()
+        .arg("verify")
+        .arg(&z)
+        .stdout(closed())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+    // stderr: the first -v line comes when the temp file is there
+    let o = t.join("out");
+    fs::create_dir_all(&o).unwrap();
+    let out = bin()
+        .arg("pack")
+        .arg("-v")
+        .arg(&src)
+        .arg("-o")
+        .arg(o.join("o.zip"))
+        .stderr(closed())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(fs::read_dir(&o).unwrap().count(), 0);
+}
+
 #[cfg(unix)]
 fn mode(p: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;

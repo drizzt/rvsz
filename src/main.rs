@@ -820,11 +820,14 @@ fn run_jobs(
                         let started = || {
                             if batch && !p.on() {
                                 // a big zip at level 19 can take an hour: show it started
-                                eprintln!(
-                                    "{}{} ({w} worker{})",
-                                    color::word(true, SKY, "packing", 8),
-                                    job.dest.display(),
-                                    if w == 1 { "" } else { "s" }
+                                p.line(
+                                    true,
+                                    &format!(
+                                        "{}{} ({w} worker{})",
+                                        color::word(true, SKY, "packing", 8),
+                                        job.dest.display(),
+                                        if w == 1 { "" } else { "s" }
+                                    ),
                                 );
                             }
                         };
@@ -1098,7 +1101,7 @@ fn main() {
                     run_jobs(jobs, format, total, mem, &opts, true)
                 }
                 Err(e) => {
-                    eprintln!("{}{e}", err_word());
+                    progress::print_line(true, &format!("{}{e}", err_word()));
                     false
                 }
             }
@@ -1139,7 +1142,7 @@ fn main() {
                     if jobs.is_empty() {
                         // a silent exit 0 looks like a finished run
                         let what = if pack_dirs { "zip or directory" } else { "zip" };
-                        eprintln!("nothing to do: no {what} found");
+                        progress::print_line(true, &format!("nothing to do: no {what} found"));
                     }
                     let jobs = jobs
                         .into_iter()
@@ -1153,7 +1156,7 @@ fn main() {
                     run_jobs(jobs, format, total, mem, &opts, true)
                 }
                 Err(e) => {
-                    eprintln!("{}{e}", err_word());
+                    progress::print_line(true, &format!("{}{e}", err_word()));
                     false
                 }
             }

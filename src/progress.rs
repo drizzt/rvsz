@@ -7,7 +7,7 @@
 //! and ETA. Other output goes through `line` so it scrolls above the rows.
 
 use crate::color::{self, GREEN, GREY, SKY};
-use crate::sys;
+use crate::{sys, zipwrite};
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -162,20 +162,13 @@ impl Progress {
     /// Prints `text` as a line on stderr or stdout, above the display.
     pub fn line(&self, stderr: bool, text: &str) {
         if !self.on {
-            if stderr {
-                eprintln!("{text}");
-            } else {
-                println!("{text}");
-            }
-            return;
+            return print_line(stderr, text);
         }
         self.redraw(|err| {
             if stderr {
                 let _ = writeln!(err, "{text}");
             } else {
-                let mut out = io::stdout().lock();
-                let _ = writeln!(out, "{text}");
-                let _ = out.flush();
+                print_line(false, text);
             }
         });
     }
@@ -204,6 +197,25 @@ impl Progress {
         st.drawn = lines.len();
         let _ = err.flush();
     }
+}
+
+/// Prints `text` as a line on stderr or stdout. If the write fails (the
+/// reader of a pipe went away, the disk is full), the run ends here with
+/// status 1 and no temp file left. `println!` would panic instead, and a
+/// panic is an abort with a core dump in a release build.
+pub fn print_line(stderr: bool, text: &str) {
+    let r = if stderr {
+        writeln!(io::stderr().lock(), "{text}")
+    } else {
+        let mut out = io::stdout().lock();
+        writeln!(out, "{text}").and_then(|()| out.flush())
+    };
+    let Err(e) = r else { return };
+    // a closed pipe is the reader's choice: no message, as with SIGPIPE
+    if !stderr && e.kind() != io::ErrorKind::BrokenPipe {
+        let _ = writeln!(io::stderr(), "error: stdout: {e}");
+    }
+    zipwrite::remove_temp_files_and_exit(1)
 }
 
 fn erase(err: &mut io::StderrLock, st: &mut State) {
