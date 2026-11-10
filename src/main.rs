@@ -1085,6 +1085,14 @@ fn main() {
         } => {
             let (total, mem) = opts.res.budget();
             let r = (|| {
+                // a typo or an unmounted path must fail, not be created
+                // below and reported as done
+                if let Some(f) = folders.iter().find(|f| !f.is_dir()) {
+                    return Err(io::Error::other(format!(
+                        "{}: not a directory",
+                        f.display()
+                    )));
+                }
                 let mut jobs = Vec::new();
                 for folder in &folders {
                     let outdir = output.clone().unwrap_or_else(|| folder.clone());
@@ -1101,6 +1109,11 @@ fn main() {
             })();
             match r {
                 Ok(jobs) => {
+                    if jobs.is_empty() {
+                        // a silent exit 0 looks like a finished run
+                        let what = if pack_dirs { "zip or directory" } else { "zip" };
+                        eprintln!("nothing to do: no {what} found");
+                    }
                     let jobs = jobs
                         .into_iter()
                         .map(|(src, dest)| Job {

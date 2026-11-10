@@ -861,6 +861,27 @@ fn batch_multiple_folders_outdir() {
     assert!(String::from_utf8_lossy(&r.stderr).contains("both map to"));
 }
 
+#[test]
+fn batch_missing_folder_fails() {
+    let t = tmp("batch_missing");
+    let typo = t.join("typo");
+    let fails = |cmd: &mut Command| {
+        let r = cmd.output().unwrap();
+        assert!(!r.status.success());
+        assert!(String::from_utf8_lossy(&r.stderr).contains("not a directory"));
+    };
+    fails(bin().arg("batch").arg(&typo));
+    fails(bin().args(["batch", "--pack-dirs"]).arg(&typo));
+    fails(bin().arg("batch").arg(&typo).arg("-o").arg(t.join("out")));
+    // neither the folder nor the output folder was created
+    assert_eq!(fs::read_dir(&t).unwrap().count(), 0);
+
+    // an empty folder is not an error, but the run says why it did nothing
+    let r = bin().arg("batch").arg(&t).output().unwrap();
+    assert!(r.status.success());
+    assert!(String::from_utf8_lossy(&r.stderr).contains("no zip found"));
+}
+
 /// Incompressible file just under 4 GiB: compressed size crosses 4 GiB, so
 /// the data is moved down for a zip64 extra and the zip64 EOCD is used.
 /// Slow and needs ~13 GB of disk: `cargo test --release -- --ignored`.
