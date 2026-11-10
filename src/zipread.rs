@@ -183,6 +183,24 @@ impl Archive {
         if p != cd.len() {
             return bad("entry count does not match the central directory");
         }
+        // one local record listed many times is a zip bomb whose sizes and
+        // CRCs are all true: each record must end before the next one
+        // starts, the last one before the central directory. A local
+        // header is at least 30 bytes; its name and extra are not needed
+        // to keep the data read within the size of the file.
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_unstable_by_key(|&i| entries[i].offset);
+        for (k, &i) in order.iter().enumerate() {
+            let e = &entries[i];
+            let next = order.get(k + 1).map_or(cd_start, |&j| entries[j].offset);
+            let end = e.offset.checked_add(30).and_then(|x| x.checked_add(e.comp));
+            if end.is_none_or(|end| end > next) {
+                return bad(format!(
+                    "{}: overlaps another entry or the central directory",
+                    e.name
+                ));
+            }
+        }
         Ok(Archive {
             file,
             len,

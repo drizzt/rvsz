@@ -1297,6 +1297,27 @@ fn entry_count_mismatch_refused() {
     assert_eq!(fs::read_dir(&t).unwrap().count(), 1);
 }
 
+#[test]
+fn overlapping_entries_refused() {
+    let t = tmp("overlap");
+    let z = t.join("in.zip");
+    deflate_zip(&z, &[("a", b"same data"), ("b", b"same data")]);
+    // the second central directory header now points at the first record
+    let mut b = fs::read(&z).unwrap();
+    let c = central(&b);
+    let second = c + 4 + find(&b[c + 4..], b"PK\x01\x02");
+    b[second + 42..second + 46].fill(0);
+    fs::write(&z, &b).unwrap();
+    for cmd in ["pack", "verify", "extract"] {
+        let out = bin().arg(cmd).arg(&z).current_dir(&t).output().unwrap();
+        assert!(!out.status.success(), "{cmd}");
+        let text = [out.stdout, out.stderr].concat();
+        assert!(String::from_utf8_lossy(&text).contains("overlaps"), "{cmd}");
+    }
+    assert_eq!(fs::read(&z).unwrap(), b);
+    assert_eq!(fs::read_dir(&t).unwrap().count(), 1);
+}
+
 /// Zip with one entry whose data is `body` as is, under `method`.
 fn raw_zip(path: &Path, name: &str, method: u16, unc: u32, crc: u32, body: &[u8]) {
     let mut common = Vec::new();
