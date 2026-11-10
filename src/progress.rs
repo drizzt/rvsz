@@ -139,15 +139,16 @@ impl Progress {
         if !self.on {
             return Bar { p: self, row: None };
         }
+        let name = clean(name);
+        let w = name.chars().count();
         let row = Arc::new(Row {
-            name: name.to_string(),
+            name,
             size,
             total: AtomicU64::new(0),
             done: Arc::new(AtomicU64::new(0)),
             created: Instant::now(),
             begun_ms: AtomicU64::new(0),
         });
-        let w = name.chars().count();
         {
             let mut st = self.lock();
             st.name_w = st.name_w.max(w);
@@ -216,6 +217,22 @@ pub fn print_line(stderr: bool, text: &str) {
         let _ = writeln!(io::stderr(), "error: stdout: {e}");
     }
     zipwrite::remove_temp_files_and_exit(1)
+}
+
+/// `s` with its control characters made visible (ESC as `\u{1b}`). Names of
+/// files and of zip entries come from outside: printed as they are, they
+/// could erase the line, move the cursor or start a new line, and so show
+/// a result that is not the real one.
+pub fn clean(s: impl std::fmt::Display) -> String {
+    let mut out = String::new();
+    for c in s.to_string().chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn erase(err: &mut io::StderrLock, st: &mut State) {
@@ -542,6 +559,15 @@ mod tests {
         assert!(colored.iter().all(|l| l.contains('\x1b')), "{colored:?}");
         let stripped: Vec<String> = colored.iter().map(|l| strip(l)).collect();
         assert_eq!(stripped, plain);
+    }
+
+    #[test]
+    fn clean_shows_control_characters() {
+        assert_eq!(clean("a\x1b[2K\rb\n\u{9b}c"), "a\\u{1b}[2K\\rb\\n\\u{9b}c");
+        assert_eq!(
+            clean("\u{65E5}\u{672C} it's \\ fine"),
+            "\u{65E5}\u{672C} it's \\ fine"
+        );
     }
 
     #[test]

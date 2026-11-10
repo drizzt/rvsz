@@ -1403,6 +1403,64 @@ fn overlapping_entries_refused() {
     assert_eq!(fs::read_dir(&t).unwrap().count(), 1);
 }
 
+/// Names from a zip or from the disk are printed with their control
+/// characters made visible: none reaches the terminal as it is.
+#[test]
+fn names_printed_without_control_characters() {
+    let t = tmp("escapes");
+    let z = t.join("in.zip");
+    raw_zip(
+        &z,
+        "x\r\x1b[2Kfine.zip: RVZSTD\x1b[8m",
+        0,
+        4,
+        crc32fast::hash(b"data"),
+        b"data",
+    );
+    // bit 11: the name is UTF-8, so its bytes are not CP437 glyphs
+    let mut b = fs::read(&z).unwrap();
+    let c = central(&b);
+    b[7] |= 8;
+    b[c + 9] |= 8;
+    fs::write(&z, &b).unwrap();
+    let plain = |out: &[u8]| {
+        let s = String::from_utf8_lossy(out).replace("\r\n", "\n");
+        assert!(!s.contains(['\x1b', '\r']), "{s:?}");
+        s
+    };
+    // entry names in the -v lines
+    let o = t.join("o.zip");
+    let out = bin()
+        .arg("pack")
+        .arg("-v")
+        .arg(&z)
+        .arg("-o")
+        .arg(&o)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(plain(&out.stderr).contains("x\\r\\u{1b}[2Kfine.zip"));
+    // and in the reason of verify: the DOS time is not the format's
+    let mut b = fs::read(&o).unwrap();
+    b[10] ^= 1;
+    fs::write(&o, &b).unwrap();
+    let out = bin().arg("verify").arg(&o).output().unwrap();
+    assert!(!out.status.success());
+    let s = plain(&out.stdout);
+    assert!(s.contains("invalid") && s.contains("\\u{1b}[8m"), "{s}");
+    // file names (Windows has no control characters in them)
+    #[cfg(unix)]
+    {
+        let d = t.join("d");
+        fs::create_dir_all(&d).unwrap();
+        deflate_zip(&d.join("a\x1b[2Jb.zip"), &[("f", b"x")]);
+        let out = bin().arg("batch").arg(&d).output().unwrap();
+        assert!(out.status.success());
+        plain(&out.stderr);
+        assert!(plain(&out.stdout).contains("a\\u{1b}[2Jb.zip"));
+    }
+}
+
 /// Zip with one entry whose data is `body` as is, under `method`.
 fn raw_zip(path: &Path, name: &str, method: u16, unc: u32, crc: u32, body: &[u8]) {
     let mut common = Vec::new();

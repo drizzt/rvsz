@@ -19,7 +19,7 @@ use clap::{Args, Parser, Subcommand};
 use codec::Codec;
 use color::{GREEN, GREY, RED, SKY};
 use entries::{Entry, Source};
-use progress::{Bar, Progress};
+use progress::{Bar, Progress, clean};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
@@ -213,7 +213,7 @@ fn write_zip(
     let verbose = opts.verbose;
     let mut w = ZipWriter::create(dest, fmt)?;
     // batch runs several zips at once: the prefix tells their lines apart
-    let tag = dest.file_name().unwrap_or_default().to_string_lossy();
+    let tag = clean(dest.file_name().unwrap_or_default().to_string_lossy());
     let reused = |i: usize| old.as_ref().and_then(|(a, m)| m[i].map(|j| (a, j)));
     // copied entries are decoded to check them, much faster than an
     // encode: the bar counts them too, the summary only the encode work
@@ -231,7 +231,7 @@ fn write_zip(
             true,
             &format!(
                 "packing {}: {} entries ({copied} copied), {} to encode",
-                dest.display(),
+                clean(dest.display()),
                 list.len(),
                 human(total)
             ),
@@ -246,7 +246,7 @@ fn write_zip(
                         "{tag} [{}/{}] {} ({}){}",
                         i + 1,
                         list.len(),
-                        e.name,
+                        clean(&e.name),
                         human(e.size),
                         if copied { " copied" } else { "" }
                     ),
@@ -264,7 +264,7 @@ fn write_zip(
                 true,
                 &format!(
                     "{tag}: {}: bad data in the existing output, encoding it again",
-                    e.name
+                    clean(&e.name)
                 ),
             );
         }
@@ -474,7 +474,7 @@ fn pack(
                 &format!(
                     "{}{}",
                     color::word(true, GREY, "checking", 9),
-                    dest.display()
+                    clean(dest.display())
                 ),
             );
         }
@@ -512,7 +512,7 @@ fn warn_leftovers(dest: &Path, bar: &Bar) {
                 true,
                 &format!(
                     "warning: {}: temp file of an interrupted run (remove it if no other rvsz is running)",
-                    d.path().display()
+                    clean(d.path().display())
                 ),
             );
         }
@@ -855,7 +855,7 @@ fn run_jobs(
                                     &format!(
                                         "{}{} ({w} worker{})",
                                         color::word(true, SKY, "packing", 8),
-                                        job.dest.display(),
+                                        clean(job.dest.display()),
                                         if w == 1 { "" } else { "s" }
                                     ),
                                 );
@@ -871,7 +871,7 @@ fn run_jobs(
                                 &format!(
                                     "{}{}",
                                     color::word(false, GREEN, "packed", 8),
-                                    job.dest.display()
+                                    clean(job.dest.display())
                                 ),
                             ),
                             Ok(Outcome::Skipped) => p.line(
@@ -879,11 +879,12 @@ fn run_jobs(
                                 &format!(
                                     "{}{} (already valid)",
                                     color::word(false, GREY, "skipped", 8),
-                                    job.dest.display()
+                                    clean(job.dest.display())
                                 ),
                             ),
                             Err(e) => {
-                                p.line(true, &format!("{}{}: {e}", err_word(), job.src.display()));
+                                let src = clean(job.src.display());
+                                p.line(true, &format!("{}{src}: {}", err_word(), clean(e)));
                                 failed.store(true, Ordering::Relaxed);
                             }
                         }
@@ -1131,7 +1132,7 @@ fn main() {
                     run_jobs(jobs, format, total, mem, &opts, true)
                 }
                 Err(e) => {
-                    progress::print_line(true, &format!("{}{e}", err_word()));
+                    progress::print_line(true, &format!("{}{}", err_word(), clean(e)));
                     false
                 }
             }
@@ -1186,7 +1187,7 @@ fn main() {
                     run_jobs(jobs, format, total, mem, &opts, true)
                 }
                 Err(e) => {
-                    progress::print_line(true, &format!("{}{e}", err_word()));
+                    progress::print_line(true, &format!("{}{}", err_word(), clean(e)));
                     false
                 }
             }
@@ -1235,15 +1236,20 @@ fn main() {
                     match r {
                         Ok(fmt) => p.line(
                             false,
-                            &format!("{}: {}", z.display(), color::paint(on, GREEN, fmt.name())),
+                            &format!(
+                                "{}: {}",
+                                clean(z.display()),
+                                color::paint(on, GREEN, fmt.name())
+                            ),
                         ),
                         Err(e) => {
                             p.line(
                                 false,
                                 &format!(
-                                    "{}: {}: {e}",
-                                    z.display(),
-                                    color::paint(on, RED, "invalid")
+                                    "{}: {}: {}",
+                                    clean(z.display()),
+                                    color::paint(on, RED, "invalid"),
+                                    clean(e)
                                 ),
                             );
                             ok = false;
@@ -1263,7 +1269,8 @@ fn main() {
                 match r {
                     Ok(()) => true,
                     Err(e) => {
-                        p.line(true, &format!("{}{}: {e}", err_word(), zip.display()));
+                        let zip = clean(zip.display());
+                        p.line(true, &format!("{}{zip}: {}", err_word(), clean(e)));
                         false
                     }
                 }
