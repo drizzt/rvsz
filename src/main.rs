@@ -453,6 +453,7 @@ fn pack(
         let a = Archive::open(input)?;
         if !force && validate::check(&a, fmt, None).is_ok() {
             if !same_file(input, dest) {
+                warn_leftovers(dest, bar);
                 copy_atomic(input, dest)?;
                 return Ok(Outcome::Written);
             }
@@ -485,8 +486,37 @@ fn pack(
         }
     }
     started();
+    warn_leftovers(dest, bar);
     write_zip(src, old, &list, dest, fmt, enc, opts, bar)?;
     Ok(Outcome::Written)
+}
+
+/// Warns about temp files next to `dest` that a killed run left there
+/// (SIGKILL, power loss): they are hidden, and nothing else ever removes or
+/// mentions them. Each directory is listed once, before the first write into
+/// it. Not removed here: another rvsz, maybe on another host of a shared
+/// folder, may be writing them.
+fn warn_leftovers(dest: &Path, bar: &Bar) {
+    static SEEN: Mutex<std::collections::BTreeSet<PathBuf>> =
+        Mutex::new(std::collections::BTreeSet::new());
+    let dir = zipwrite::out_dir(dest);
+    if !SEEN.lock().unwrap().insert(dir.to_path_buf()) {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for d in rd.flatten() {
+        let pid = d.file_name().to_str().and_then(zipwrite::temp_name_pid);
+        // the ones of this process are in use
+        if pid.is_some_and(|p| p != std::process::id()) {
+            bar.line(
+                true,
+                &format!(
+                    "warning: {}: temp file of an interrupted run (remove it if no other rvsz is running)",
+                    d.path().display()
+                ),
+            );
+        }
+    }
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -904,8 +934,8 @@ fn open_dirs<'a>(
 /// `path`; returns the file and its name. The name does not hold the
 /// entry's own, which may be as long as a file name can be.
 fn create_temp_at(dir: &sys::Dir, path: &Path) -> io::Result<(File, OsString)> {
-    for n in 0..100 {
-        let name = OsString::from(format!(".rvsz-{}-{n}.tmp", std::process::id()));
+    for _ in 0..100 {
+        let name = OsString::from(zipwrite::temp_name());
         let tracked = path.with_file_name(&name);
         match zipwrite::create_tracked(&tracked, || sys::create_new_at(dir, &name)) {
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}

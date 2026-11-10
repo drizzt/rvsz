@@ -944,7 +944,19 @@ fn zip64_compressed_size_only() {
 #[cfg(unix)]
 #[test]
 fn sigint_removes_temp_file() {
-    let t = tmp("sigint");
+    signal_removes_temp_file("sigint", "-INT", 130);
+}
+
+/// Ctrl+\ does the same.
+#[cfg(unix)]
+#[test]
+fn sigquit_removes_temp_file() {
+    signal_removes_temp_file("sigquit", "-QUIT", 131);
+}
+
+#[cfg(unix)]
+fn signal_removes_temp_file(dir: &str, signal: &str, status: i32) {
+    let t = tmp(dir);
     let src = t.join("src");
     fs::create_dir_all(&src).unwrap();
     // incompressible, so level 19 takes a few seconds
@@ -976,15 +988,65 @@ fn sigint_removes_temp_file() {
     }
     assert!(
         Command::new("kill")
-            .arg("-INT")
+            .arg(signal)
             .arg(child.id().to_string())
             .status()
             .unwrap()
             .success()
     );
     let st = child.wait().unwrap();
-    assert_eq!(st.code(), Some(130));
+    assert_eq!(st.code(), Some(status));
     assert_eq!(list(), 0);
+}
+
+/// A temp file of a run that was killed is reported by the next run that
+/// writes next to it, and is not packed into a zip.
+#[test]
+fn leftover_temp_file_reported() {
+    let t = tmp("leftover");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("f"), b"x").unwrap();
+    let out = t.join("out");
+    fs::create_dir_all(&out).unwrap();
+    // pid 1 is never this tool
+    let left = out.join(".rvsz-1-0.tmp");
+    fs::write(&left, b"half a zip").unwrap();
+    let z = out.join("o.zip");
+    let r = bin()
+        .arg("pack")
+        .arg(&src)
+        .arg("-o")
+        .arg(&z)
+        .output()
+        .unwrap();
+    assert!(r.status.success());
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        err.contains("warning:") && err.contains(".rvsz-1-0.tmp"),
+        "{err}"
+    );
+    assert!(left.exists() && z.exists());
+    // nothing is written by a second run: no warning
+    let r = bin()
+        .arg("pack")
+        .arg(&src)
+        .arg("-o")
+        .arg(&z)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&r.stderr), "");
+    // inside a directory to pack it would become an entry
+    let r = bin()
+        .arg("pack")
+        .arg(&out)
+        .arg("-o")
+        .arg(t.join("p.zip"))
+        .output()
+        .unwrap();
+    assert!(!r.status.success());
+    assert!(String::from_utf8_lossy(&r.stderr).contains("temp file of an interrupted run"));
+    assert!(!t.join("p.zip").exists());
 }
 
 /// A reader that goes away (`rvsz verify ... | head -n 1`) ends the run with
@@ -1025,6 +1087,29 @@ fn closed_pipe_ends_run() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(fs::read_dir(&o).unwrap().count(), 0);
+}
+
+/// The temp file's name does not grow with the output's: a zip whose name is
+/// as long as a file name can be (255 bytes) is written, and rewritten.
+#[test]
+fn longest_output_name() {
+    let t = tmp("long_name");
+    let src = t.join("a".repeat(251));
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("f"), b"x").unwrap();
+    let z = t.join("a".repeat(251) + ".zip");
+    assert!(ok(bin().arg("pack").arg(&src)));
+    assert!(ok(bin()
+        .arg("pack")
+        .arg("--format")
+        .arg("trrntzip")
+        .arg(&z)));
+    assert!(ok(bin()
+        .arg("verify")
+        .arg("--format")
+        .arg("trrntzip")
+        .arg(&z)));
+    assert_eq!(fs::read_dir(&t).unwrap().count(), 2);
 }
 
 #[cfg(unix)]

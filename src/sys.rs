@@ -146,12 +146,14 @@ mod unix {
         Ok(Some((st.st_dev, st.st_ino)))
     }
 
-    /// On SIGINT, SIGTERM or SIGHUP, removes unfinished temp files and exits
-    /// with 128 + signal. Runs on its own thread, so the cleanup is not limited
-    /// to what a signal handler may do.
+    /// On SIGINT, SIGTERM, SIGHUP or SIGQUIT, removes unfinished temp files
+    /// and exits with 128 + signal (SIGQUIT then leaves no core dump). Runs
+    /// on its own thread, so the cleanup is not limited to what a signal
+    /// handler may do.
     pub fn cleanup_on_signal() {
-        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
-        let mut sigs = match signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP]) {
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+        let sigs = signal_hook::iterator::Signals::new([SIGINT, SIGTERM, SIGHUP, SIGQUIT]);
+        let mut sigs = match sigs {
             Ok(s) => s,
             Err(e) => {
                 crate::progress::print_line(

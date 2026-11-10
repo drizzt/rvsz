@@ -11,6 +11,7 @@ use crate::sys::{self, FileExt};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 pub const METHOD_STORED: u16 = 0;
@@ -288,21 +289,38 @@ pub fn out_dir(dest: &Path) -> &Path {
         .unwrap_or(Path::new("."))
 }
 
+static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+/// A temp file name not used before by this process. It does not hold the
+/// name of the file it stands in for: that one may already be as long as a
+/// file name can be.
+pub fn temp_name() -> String {
+    let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    format!(".rvsz-{}-{n}.tmp", std::process::id())
+}
+
+/// The pid in a name made by `temp_name`, None for any other name.
+pub fn temp_name_pid(name: &str) -> Option<u32> {
+    let (pid, n) = name
+        .strip_prefix(".rvsz-")?
+        .strip_suffix(".tmp")?
+        .split_once('-')?;
+    n.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
 /// Creates and tracks a new temp file next to `dest`. `create_new` never
 /// opens an existing name, so a symlink planted there is not followed. If
 /// `dest` is a regular file, its owner (best effort) and mode carry over.
 pub fn create_temp(dest: &Path) -> io::Result<(File, PathBuf)> {
     let dir = out_dir(dest);
-    let fname = dest
-        .file_name()
-        .ok_or_else(|| io::Error::other("bad output path"))?;
+    if dest.file_name().is_none() {
+        return Err(io::Error::other("bad output path"));
+    }
     let old = fs::symlink_metadata(dest).ok().filter(|m| m.is_file());
-    for n in 0..100 {
-        // not lossy: two non-UTF-8 names must not share one temp file
-        let mut t = std::ffi::OsString::from(".");
-        t.push(fname);
-        t.push(format!(".{}.{n}.tmp", std::process::id()));
-        let tmp = dir.join(t);
+    // a name can be taken: left by an earlier process with this pid, or planted
+    for _ in 0..100 {
+        let tmp = dir.join(temp_name());
         // read access is needed to move data for the zip64 fix-up
         let mut o = fs::OpenOptions::new();
         o.read(true).write(true).create_new(true);
@@ -515,11 +533,14 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         let victim = d.join("victim");
         fs::write(&victim, b"SECRET").unwrap();
-        let link = d.join(format!(".o.zip.{}.0.tmp", std::process::id()));
+        // no other unit test makes temp files, so the next name is known
+        let n = NEXT_TEMP.load(Ordering::Relaxed);
+        let name = |n: u64| d.join(format!(".rvsz-{}-{n}.tmp", std::process::id()));
+        let link = name(n);
         std::os::unix::fs::symlink(&victim, &link).unwrap();
         let (mut f, tmp) = create_temp(&d.join("o.zip")).unwrap();
         f.write_all(b"zip").unwrap();
-        assert_eq!(tmp, d.join(format!(".o.zip.{}.1.tmp", std::process::id())));
+        assert_eq!(tmp, name(n + 1));
         assert_eq!(fs::read(&victim).unwrap(), b"SECRET");
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
         untrack_temp(&tmp);

@@ -4,9 +4,9 @@
 
 //! Builds the sorted entry list of an RVZSTD zip from a directory or a zip.
 
-use crate::cp437;
 use crate::sort::{dir_contains, tz_cmp, tz_cmp_case, utf16};
 use crate::zipread::Archive;
+use crate::{cp437, zipwrite};
 use std::cmp::Ordering;
 use std::fs;
 use std::io;
@@ -71,6 +71,13 @@ fn walk(root: &Path, rel: &str, out: &mut Vec<Entry>) -> io::Result<()> {
         } else if ft.is_dir() {
             walk(root, &name, out)?;
         } else if ft.is_file() {
+            // left by a run that was killed, or still being written
+            if zipwrite::temp_name_pid(fname).is_some() {
+                return Err(io::Error::other(format!(
+                    "{}: temp file of an interrupted run, not packed (remove it)",
+                    d.path().display()
+                )));
+            }
             out.push(Entry::new(
                 name,
                 d.metadata()?.len(),
