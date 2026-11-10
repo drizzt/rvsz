@@ -171,7 +171,7 @@ enum Input {
 
 fn source_reader<'a>(input: &'a Input, e: &Entry) -> io::Result<Box<dyn Read + 'a>> {
     match (&e.src, input) {
-        // `pump` reads in 1 MiB chunks, so a BufReader would add nothing
+        // `pump` reads in chunks of up to 1 MiB, so a BufReader would add nothing
         (Source::File(p), _) => Ok(Box::new(open_source(p, e.size)?)),
         (Source::Zip(i, _), Input::Zip(a)) => a.open_entry(*i),
         _ => unreachable!(),
@@ -369,7 +369,7 @@ fn copy_checked(
     let got = zipread::decoder(
         name,
         z.method,
-        io::BufReader::with_capacity(1 << 20, &mut tee),
+        io::BufReader::with_capacity(zipread::buf_len(z.comp), &mut tee),
     )
     .and_then(|d| pump(d, z.unc, |_| Ok(())));
     if let Some(e) = tee.err.take() {
@@ -969,7 +969,7 @@ fn extract_file(
     let e = &a.entries[i];
     let (out, tmp) = create_temp_at(dir, path)?;
     let r = (|| {
-        let mut f = io::BufWriter::with_capacity(1 << 20, out);
+        let mut f = io::BufWriter::with_capacity(zipread::buf_len(e.unc), out);
         let (n, crc) = pump(a.open_entry(i)?, e.unc, |b| {
             bar.add(b.len());
             io::Write::write_all(&mut f, b)

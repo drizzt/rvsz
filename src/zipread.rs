@@ -250,7 +250,7 @@ impl Archive {
         if e.flags & 1 != 0 {
             return bad(format!("{}: encrypted entries are not supported", e.name));
         }
-        let raw = BufReader::with_capacity(1 << 20, self.raw(i)?);
+        let raw = BufReader::with_capacity(buf_len(e.comp), self.raw(i)?);
         decoder(&e.name, e.method, raw)
     }
 }
@@ -269,6 +269,14 @@ pub fn decoder<'a>(
     })
 }
 
+/// Length of an I/O buffer for `n` bytes of data: 1 MiB at most, and no more
+/// than the data needs. With a fixed 1 MiB per buffer, a zip of thousands of
+/// small entries spends most of its time on getting and returning that
+/// memory (musl maps and unmaps every buffer of this size).
+pub fn buf_len(n: u64) -> usize {
+    n.clamp(1, 1 << 20) as usize
+}
+
 /// Reads `r` to the end, passing chunks to `f`; returns (size, crc32).
 /// Fails before passing on any byte past `limit`, so data longer than its
 /// header says (a zip bomb) costs neither disk nor CPU beyond `limit`.
@@ -277,7 +285,8 @@ pub fn pump(
     limit: u64,
     mut f: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<(u64, u32)> {
-    let mut buf = vec![0u8; 1 << 20];
+    // one byte more than the limit, so that data past it is seen
+    let mut buf = vec![0u8; buf_len(limit.saturating_add(1))];
     let mut h = crc32fast::Hasher::new();
     let mut n = 0u64;
     loop {
@@ -295,4 +304,19 @@ pub fn pump(
         f(&buf[..k])?;
     }
     Ok((n, h.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pump_stops_past_limit() {
+        for limit in [0, 1, 5, (1 << 20) - 1, 1 << 20, (1 << 20) + 1] {
+            let data = vec![7u8; limit + 1];
+            let all = pump(&data[..limit], limit as u64, |_| Ok(())).unwrap();
+            assert_eq!(all.0, limit as u64);
+            assert!(pump(&data[..], limit as u64, |_| Ok(())).is_err());
+        }
+    }
 }
