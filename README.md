@@ -33,7 +33,8 @@ pack and batch options:
 global options:
   -j N           total zstd worker threads; with TorrentZip, zips packed
                  at once (default: CPU count)
-  --max-mem MiB  memory budget for encoders (default: 3/4 of MemAvailable)
+  --max-mem MiB  memory budget for encoders (default: 3/4 of the free
+                 memory; of all memory on macOS)
   --force        rewrite even if the target is already valid, and encode
                  every entry (no copy from the existing output)
   --trust-existing  copy entries from the existing output without

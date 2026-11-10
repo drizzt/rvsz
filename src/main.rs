@@ -46,7 +46,8 @@ struct Resources {
     /// (default: number of CPUs)
     #[arg(short = 'j', long)]
     jobs: Option<usize>,
-    /// Memory budget in MiB for concurrent encoders and decoders (default: 3/4 of MemAvailable)
+    /// Memory budget in MiB for concurrent encoders and decoders (default:
+    /// 3/4 of the free memory; of all memory on macOS)
     #[arg(long)]
     max_mem: Option<u64>,
 }
@@ -124,7 +125,8 @@ enum Cmd {
         /// zstd worker threads for --deep re-encoding (default: number of CPUs)
         #[arg(short = 'j', long)]
         jobs: Option<usize>,
-        /// Memory budget in MiB for --deep (default: 3/4 of MemAvailable)
+        /// Memory budget in MiB for --deep (default: 3/4 of the free memory;
+        /// of all memory on macOS)
         #[arg(long)]
         max_mem: Option<u64>,
     },
@@ -155,7 +157,13 @@ fn decoder_mem_mib() -> u64 {
 const DEFLATE_MEM_MIB: u64 = 16;
 
 fn mem_available_mib() -> u64 {
-    sys::mem_available_mib().unwrap_or(1024)
+    sys::mem_available_mib().unwrap_or_else(|| {
+        progress::print_line(
+            true,
+            "warning: free memory unknown, assuming 1024 MiB (set --max-mem)",
+        );
+        1024
+    })
 }
 
 enum Outcome {
@@ -1206,8 +1214,13 @@ fn main() {
             jobs,
             max_mem,
         } => {
-            let (total, mem) = Resources { jobs, max_mem }.budget();
-            let workers = fit_workers(total, mem.saturating_sub(decoder_mem_mib())) as u32;
+            // only --deep makes encoders and has memory to plan
+            let workers = if deep {
+                let (total, mem) = Resources { jobs, max_mem }.budget();
+                fit_workers(total, mem.saturating_sub(decoder_mem_mib())) as u32
+            } else {
+                1
+            };
             // made on first use, one per format
             let mut encs: [Option<Codec>; 2] = [None, None];
             let sizes: Vec<u64> = zips

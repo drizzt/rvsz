@@ -170,14 +170,45 @@ mod unix {
         });
     }
 
-    /// MemAvailable in MiB, or None if unknown.
+    /// Memory that is free for new use, in MiB, or None if unknown.
+    #[cfg(not(target_os = "macos"))]
     pub fn mem_available_mib() -> Option<u64> {
-        fs::read_to_string("/proc/meminfo").ok().and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemAvailable:"))
-                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-                .map(|kb| kb / 1024)
-        })
+        meminfo_mib(&fs::read_to_string("/proc/meminfo").ok()?)
+    }
+
+    /// The same from the text of /proc/meminfo: MemAvailable, or for a
+    /// kernel before 3.14, which has no such line, what `free` took as
+    /// available then.
+    #[cfg(not(target_os = "macos"))]
+    fn meminfo_mib(s: &str) -> Option<u64> {
+        let kb = |key: &str| {
+            s.lines().find_map(|l| {
+                let v = l.strip_prefix(key)?.strip_prefix(':')?;
+                v.split_whitespace().next()?.parse::<u64>().ok()
+            })
+        };
+        let free =
+            kb("MemAvailable").or_else(|| Some(kb("MemFree")? + kb("Buffers")? + kb("Cached")?))?;
+        Some(free / 1024)
+    }
+
+    /// All installed memory in MiB. macOS keeps most memory in use as file
+    /// cache and has no one number for what is free.
+    #[cfg(target_os = "macos")]
+    pub fn mem_available_mib() -> Option<u64> {
+        let mut size = 0u64;
+        let mut len = size_of::<u64>();
+        // SAFETY: hw.memsize is a u64, and `size` and `len` describe one
+        let r = unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&raw mut size).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (r == 0).then_some(size >> 20)
     }
 
     /// Columns and rows of the terminal on stderr.
@@ -192,6 +223,19 @@ mod unix {
     /// Terminals take ANSI escapes as they are.
     pub fn enable_vt(_stderr: bool) -> bool {
         true
+    }
+
+    #[cfg(all(test, not(target_os = "macos")))]
+    #[test]
+    fn meminfo_without_memavailable() {
+        let new = "MemTotal: 8000000 kB\nMemFree: 1024 kB\nMemAvailable:   4096000 kB\n";
+        assert_eq!(meminfo_mib(new), Some(4000));
+        // before Linux 3.14: no MemAvailable line
+        let old = "MemTotal: 1000000 kB\nMemFree: 102400 kB\nBuffers: 2048 kB\n\
+                   Cached: 204800 kB\nSwapCached: 999999 kB\n";
+        assert_eq!(meminfo_mib(old), Some(302));
+        assert_eq!(meminfo_mib(""), None);
+        assert_eq!(meminfo_mib("MemFree: 102400 kB\n"), None);
     }
 }
 
