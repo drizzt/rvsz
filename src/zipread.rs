@@ -178,6 +178,11 @@ impl Archive {
             });
             p = end;
         }
+        // headers past the count (a 16-bit count that wrapped, or a wrong
+        // one) would be dropped without a word by a rewrite
+        if p != cd.len() {
+            return bad("entry count does not match the central directory");
+        }
         Ok(Archive {
             file,
             len,

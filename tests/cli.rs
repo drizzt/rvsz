@@ -1136,6 +1136,30 @@ fn bomb_is_bounded() {
     assert!(!o.exists());
 }
 
+#[test]
+fn entry_count_mismatch_refused() {
+    let t = tmp("count_mismatch");
+    let z = t.join("in.zip");
+    deflate_zip(&z, &[("a", b"1"), ("b", b"2"), ("c", b"3")]);
+    // the end record now counts 2 of the 3 central directory headers
+    let mut b = fs::read(&z).unwrap();
+    let e = b.len() - 22;
+    b[e + 8..e + 12].copy_from_slice(&[2, 0, 2, 0]);
+    fs::write(&z, &b).unwrap();
+    for cmd in ["pack", "verify", "extract"] {
+        let out = bin().arg(cmd).arg(&z).current_dir(&t).output().unwrap();
+        assert!(!out.status.success(), "{cmd}");
+        let text = [out.stdout, out.stderr].concat();
+        assert!(
+            String::from_utf8_lossy(&text).contains("entry count does not match"),
+            "{cmd}"
+        );
+    }
+    // the in-place rewrite did not touch the zip, extract wrote nothing
+    assert_eq!(fs::read(&z).unwrap(), b);
+    assert_eq!(fs::read_dir(&t).unwrap().count(), 1);
+}
+
 /// Zip with one entry whose data is `body` as is, under `method`.
 fn raw_zip(path: &Path, name: &str, method: u16, unc: u32, crc: u32, body: &[u8]) {
     let mut common = Vec::new();
