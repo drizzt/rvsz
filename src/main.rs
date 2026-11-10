@@ -575,17 +575,18 @@ fn batch_jobs(folder: &Path, outdir: &Path) -> io::Result<Vec<(PathBuf, PathBuf)
 /// `-o` directory, the same folder given twice, or one folder inside another.
 /// Every output parent exists by now (created while collecting the jobs).
 fn check_dest_collisions(jobs: &[(PathBuf, PathBuf)]) -> io::Result<()> {
+    use std::collections::hash_map::Entry as Slot;
     let mut seen = std::collections::HashMap::new();
+    let mut folds = HashMap::new();
     for (src, dest) in jobs {
         // a bare file name has an empty parent, which canonicalize rejects
-        let parent = dest
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let key = (
-            fs::canonicalize(parent)?,
-            dest.file_name().map(OsStr::to_owned),
-        );
+        let parent = fs::canonicalize(zipwrite::out_dir(dest))?;
+        let fold = match folds.entry(parent.clone()) {
+            Slot::Occupied(o) => *o.get(),
+            Slot::Vacant(v) => *v.insert(ignores_case(&parent)?),
+        };
+        let name = dest.file_name().map(|n| name_key(n, fold));
+        let key = (parent, name);
         if let Some(prev) = seen.insert(key, src) {
             return Err(io::Error::other(format!(
                 "{} and {} both map to {}",
@@ -596,6 +597,32 @@ fn check_dest_collisions(jobs: &[(PathBuf, PathBuf)]) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// File name as a collision key. Where the file system ignores case
+/// (`fold`), `Game.zip` and `game.zip` are one file, and the second job
+/// would replace the output of the first.
+fn name_key(name: &OsStr, fold: bool) -> OsString {
+    if fold {
+        name.to_string_lossy().to_lowercase().into()
+    } else {
+        name.to_owned()
+    }
+}
+
+/// True if the file system holding `dir` ignores case. Probed, not taken
+/// from the OS: a Linux build can write to exFAT, a CIFS share or a
+/// casefold folder, and macOS can have a case-sensitive volume. Creates a
+/// temp file with a lowercase name and looks for it under the uppercase one.
+fn ignores_case(dir: &Path) -> io::Result<bool> {
+    let (f, p) = zipwrite::create_temp(&dir.join("probe"))?;
+    drop(f);
+    let upper = p.file_name().unwrap().to_string_lossy().to_uppercase();
+    let r = fs::symlink_metadata(dir.join(upper));
+    let gone = fs::remove_file(&p);
+    zipwrite::untrack_temp(&p);
+    gone?;
+    Ok(r.is_ok())
 }
 
 fn is_zip_name(b: &[u8]) -> bool {

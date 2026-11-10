@@ -1467,4 +1467,23 @@ fn pack_multiple_collisions() {
             .arg(&out),
     );
     assert!(!out.join("x.zip").exists());
+
+    // names that differ only in case are one file where the file system
+    // ignores case
+    fs::write(t.join("probe"), b"").unwrap();
+    let ignores_case = t.join("PROBE").exists();
+    let (u, l) = (t.join("u/Game"), t.join("l/game"));
+    fs::create_dir_all(&u).unwrap();
+    fs::create_dir_all(&l).unwrap();
+    fs::write(u.join("f"), b"one").unwrap();
+    fs::write(l.join("g"), b"two").unwrap();
+    let mut cmd = bin();
+    cmd.arg("pack").arg(&u).arg(&l).arg("-o").arg(&out);
+    if ignores_case {
+        fails(&mut cmd);
+        assert!(!out.join("Game.zip").exists());
+    } else {
+        assert!(ok(&mut cmd));
+        assert!(out.join("Game.zip").exists() && out.join("game.zip").exists());
+    }
 }

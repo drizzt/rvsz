@@ -280,14 +280,19 @@ pub fn create_tracked<T>(tmp: &Path, create: impl FnOnce() -> io::Result<T>) -> 
     create().inspect(|_| v.push(tmp.to_path_buf()))
 }
 
+/// Directory that holds `dest`: its parent, or `.` for a bare file name,
+/// whose parent is empty.
+pub fn out_dir(dest: &Path) -> &Path {
+    dest.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
 /// Creates and tracks a new temp file next to `dest`. `create_new` never
 /// opens an existing name, so a symlink planted there is not followed. If
 /// `dest` is a regular file, its owner (best effort) and mode carry over.
 pub fn create_temp(dest: &Path) -> io::Result<(File, PathBuf)> {
-    let dir = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+    let dir = out_dir(dest);
     let fname = dest
         .file_name()
         .ok_or_else(|| io::Error::other("bad output path"))?;
