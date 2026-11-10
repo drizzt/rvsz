@@ -42,6 +42,10 @@ pack, batch and verify --deep options:
                  memory; of all memory on macOS)
 ```
 
+`batch` leaves out every name that starts with a dot, and the folders
+Synology DSM keeps inside shared folders: `@eaDir`, `#recycle` and
+`#snapshot`.
+
 A zip that is already valid in the output format is skipped (an RVZSTD zip
 is rewritten when `--format trrntzip` is asked, and the other way round).
 Otherwise the existing output
