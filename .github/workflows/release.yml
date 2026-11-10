@@ -65,6 +65,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+      # for the provenance attestation of the archive
+      id-token: write
+      attestations: write
     defaults:
       run:
         shell: bash
@@ -87,6 +90,13 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked --target "$TARGET"
+        env:
+          TARGET: ${{ matrix.target }}
+
+      # Every runner is native for its target, so this runs the binary that
+      # is packaged below. A failure here leaves the release a draft.
+      - name: Run tests
+        run: cargo test --release --locked --target "$TARGET"
         env:
           TARGET: ${{ matrix.target }}
 
@@ -114,6 +124,14 @@ jobs:
             shasum -a 256 "$archive" > "$archive.sha256"
           fi
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      # Signed statement that this archive was built by this workflow from
+      # this commit. Check a download with:
+      #   gh attestation verify <archive> --repo drizzt/rvsz
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
 
       - name: Upload release assets
         env:
