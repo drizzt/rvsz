@@ -29,16 +29,17 @@ rvsz extract <zip> [-o dir]
 
 pack and batch options:
   --format rvzstd|trrntzip  output format (default: rvzstd)
-
-global options:
-  -j N           total zstd worker threads; with TorrentZip, zips packed
-                 at once (default: CPU count)
-  --max-mem MiB  memory budget for encoders (default: 3/4 of the free
-                 memory; of all memory on macOS)
   --force        rewrite even if the target is already valid, and encode
                  every entry (no copy from the existing output)
   --trust-existing  copy entries from the existing output without
                  decoding them to check their CRCs
+  -v             print each entry as it is packed (on stderr)
+
+pack, batch and verify --deep options:
+  -j N           total zstd worker threads; with TorrentZip, zips packed
+                 at once (default: CPU count)
+  --max-mem MiB  memory budget for encoders (default: 3/4 of the free
+                 memory; of all memory on macOS)
 ```
 
 `batch` leaves out every name that starts with a dot, and the folders
@@ -61,6 +62,31 @@ layout this tool writes; `--deep` also decompresses, checks CRCs and
 re-encodes each entry to compare the compressed bytes.
 
 Input zips may use stored, deflate or zstd entries.
+
+## What is written and replaced
+
+- Every output, a zip or an extracted file, is written to a temp file
+  `.rvsz-<pid>-<n>.tmp` in the same folder and renamed into place when it is
+  complete. An error or a signal (Ctrl+C, SIGTERM, SIGHUP, SIGQUIT) removes
+  the temp file. After SIGKILL or a power loss it stays: the next run that
+  writes into that folder names it in a warning and does not remove it, and
+  `pack` of a folder that holds one fails.
+- `pack` of a zip rewrites it in place. If the path is a symbolic link, the
+  link becomes a regular file and the file it pointed to is left as it was.
+  Another hard link to the old zip keeps the old content. `batch` fails on a
+  symbolic link to a zip or a folder.
+- `batch --pack-dirs` takes `X.zip` next to a folder `X/` as the earlier
+  output of `X/`: it is replaced by the content of the folder.
+- `extract` writes into the current directory unless `-o` is given. A file
+  that is already there is replaced, and only by a complete copy with the
+  right size and CRC. A zip with two entries for one path is refused. If
+  two entry names are one file only for the file system (`a.txt` and
+  `A.TXT` on Windows and macOS), `extract` stops at the second one and
+  leaves the first file as written.
+- The exit status is 1 after any error, also when stdout or stderr is a pipe
+  and its reader went away.
+- Control characters in a printed name are shown in escaped form
+  (ESC as `\u{1b}`).
 
 ## Performance
 
@@ -90,8 +116,10 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 The Windows binary writes the same bytes. `extract` there works by path, not
 relative to open directories, so it is weaker against links swapped in while
-it runs, and it does not reject names Windows treats specially (`a:b`, `CON`,
-a trailing dot or space).
+it runs. Names Windows treats specially get no check of their own: a name
+with a colon fails (`a:b` as an unsafe path, others with the error of
+Windows), a trailing dot or space is dropped (`name.` is written as `name`),
+and on Windows 11 `CON` and `COM1` become plain files while `NUL` fails.
 
 zstd-sys is pinned to `=2.0.9` (libzstd 1.5.5): a newer libzstd can produce
 different compressed bytes. RUSTSEC-2026-0410 affects only wasm32 builds.
