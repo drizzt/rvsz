@@ -21,7 +21,7 @@ use color::{GREEN, GREY, RED, SKY};
 use entries::{Entry, Source};
 use progress::{Bar, Progress};
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -848,29 +848,80 @@ fn safe_path(name: &str) -> Option<PathBuf> {
     (!out.as_os_str().is_empty()).then_some(out)
 }
 
-/// Opens or creates every directory of `rel` below `root` and, for a file
-/// entry, creates the file. Each step is relative to the directory opened
-/// before it, so a symlink swapped in meanwhile is never followed (on Unix;
-/// see `sys::Dir` for Windows). For a
-/// file, also returns its parent (None for `root`) and its name in there.
-fn create_at<'a>(
+/// Opens or creates every directory of `rel` below `root`. Each step is
+/// relative to the directory opened before it, so a symlink swapped in
+/// meanwhile is never followed (on Unix; see `sys::Dir` for Windows). For a
+/// file, returns its parent (None for `root`) and its name in there.
+fn open_dirs<'a>(
     root: &sys::Dir,
     rel: &'a Path,
     is_dir: bool,
-) -> io::Result<Option<(Option<sys::Dir>, &'a OsStr, File)>> {
+) -> io::Result<Option<(Option<sys::Dir>, &'a OsStr)>> {
     let parts: Vec<&OsStr> = rel.iter().collect();
     let (last, parents) = parts.split_last().expect("safe_path is not empty");
     let mut dir: Option<sys::Dir> = None;
     for p in parents {
         dir = Some(sys::open_dir_at(dir.as_ref().unwrap_or(root), p)?);
     }
-    let parent = dir.as_ref().unwrap_or(root);
     if is_dir {
-        sys::open_dir_at(parent, last)?;
+        sys::open_dir_at(dir.as_ref().unwrap_or(root), last)?;
         return Ok(None);
     }
-    let f = sys::create_file_at(parent, last)?;
-    Ok(Some((dir, last, f)))
+    Ok(Some((dir, last)))
+}
+
+/// Creates and tracks a temp file in `dir`, the open directory that holds
+/// `path`; returns the file and its name. The name does not hold the
+/// entry's own, which may be as long as a file name can be.
+fn create_temp_at(dir: &sys::Dir, path: &Path) -> io::Result<(File, OsString)> {
+    for n in 0..100 {
+        let name = OsString::from(format!(".rvsz-{}-{n}.tmp", std::process::id()));
+        let tracked = path.with_file_name(&name);
+        match zipwrite::create_tracked(&tracked, || sys::create_new_at(dir, &name)) {
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            r => return r.map(|f| (f, name)),
+        }
+    }
+    Err(io::Error::other("no free temp file name"))
+}
+
+/// Writes entry `i` to `name` in `dir` through a temp file that is renamed
+/// into place once its size and CRC are right, so a file already there is
+/// only ever replaced by a complete copy. `path` is where `name` is: the
+/// temp file is tracked by path for the cleanup on a signal, the only step
+/// that does not go through `dir`.
+fn extract_file(
+    a: &Archive,
+    i: usize,
+    dir: &sys::Dir,
+    name: &OsStr,
+    path: &Path,
+    bar: &Bar,
+) -> io::Result<()> {
+    let e = &a.entries[i];
+    let (out, tmp) = create_temp_at(dir, path)?;
+    let r = (|| {
+        let mut f = io::BufWriter::with_capacity(1 << 20, out);
+        let (n, crc) = pump(a.open_entry(i)?, e.unc, |b| {
+            bar.add(b.len());
+            io::Write::write_all(&mut f, b)
+        })?;
+        io::Write::flush(&mut f)?;
+        if n != e.unc || crc != e.crc {
+            return Err(io::Error::other("size or CRC mismatch"));
+        }
+        // on disk before the rename, else a crash can leave the name
+        // pointing at an empty file in place of the old one
+        f.get_ref().sync_all()?;
+        // closed first: Windows may refuse to rename an open file
+        drop(f);
+        sys::rename_at(dir, &tmp, name)
+    })();
+    if r.is_err() {
+        let _ = sys::unlink_at(dir, &tmp);
+    }
+    zipwrite::untrack_temp(&path.with_file_name(&tmp));
+    r
 }
 
 /// Output path of every entry, checked before anything is written: each
@@ -890,8 +941,12 @@ fn extract_paths(a: &Archive) -> io::Result<Vec<PathBuf>> {
         };
         if e.is_dir() {
             dirs.insert(rel.clone());
-        } else {
-            files.insert(rel.clone());
+        } else if !files.insert(rel.clone()) {
+            // the later one would replace the earlier one
+            return Err(io::Error::other(format!(
+                "duplicate entry in zip: {:?}",
+                e.name
+            )));
         }
         dirs.extend(rel.ancestors().skip(1).map(Path::to_path_buf));
         paths.push(rel);
@@ -911,29 +966,34 @@ fn extract(zip: &Path, outdir: &Path, bar: &Bar) -> io::Result<()> {
     bar.set_total(a.entries.iter().map(|e| e.unc).sum());
     fs::create_dir_all(outdir)?;
     let root = sys::open_root(outdir)?;
+    // each file written, by identity, with its entry
+    let mut written: HashMap<sys::FileId, usize> = HashMap::new();
     for (i, (e, rel)) in a.entries.iter().zip(&paths).enumerate() {
-        let out = create_at(&root, rel, e.is_dir())
+        open_dirs(&root, rel, e.is_dir())
+            .and_then(|file| match file {
+                Some((dir, name)) => {
+                    let dir = dir.as_ref().unwrap_or(&root);
+                    // two names can be one file: `a` and `A` where the file
+                    // system ignores case, `a.` and `a` on Windows. The
+                    // later entry would replace the earlier one
+                    let old = sys::file_id_at(dir, name)?;
+                    if let Some(&j) = old.and_then(|id| written.get(&id)) {
+                        return Err(io::Error::other(format!(
+                            "same file as {:?} on this file system",
+                            a.entries[j].name
+                        )));
+                    }
+                    extract_file(&a, i, dir, name, &outdir.join(rel), bar)?;
+                    // by name, not from the temp file: on FAT and exFAT the
+                    // identity is where the name is, and a rename moves it
+                    if let Some(id) = sys::file_id_at(dir, name)? {
+                        written.insert(id, i);
+                    }
+                    Ok(())
+                }
+                None => Ok(()),
+            })
             .map_err(|err| io::Error::other(format!("{}: {err}", e.name)))?;
-        let Some((dir, last, out)) = out else {
-            continue;
-        };
-        let r = (|| {
-            let mut f = io::BufWriter::with_capacity(1 << 20, out);
-            let (n, crc) = pump(a.open_entry(i)?, e.unc, |b| {
-                bar.add(b.len());
-                io::Write::write_all(&mut f, b)
-            })?;
-            io::Write::flush(&mut f)?;
-            if n != e.unc || crc != e.crc {
-                return Err(io::Error::other("size or CRC mismatch"));
-            }
-            Ok(())
-        })();
-        if let Err(err) = r {
-            // by name in the directory opened before, never through a path
-            let _ = sys::unlink_at(dir.as_ref().unwrap_or(&root), last);
-            return Err(io::Error::other(format!("{}: {err}", e.name)));
-        }
     }
     Ok(())
 }

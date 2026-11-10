@@ -1137,6 +1137,82 @@ fn bomb_is_bounded() {
 }
 
 #[test]
+fn extract_keeps_old_file_on_error() {
+    let t = tmp("extract_keeps_old");
+    let z = t.join("f.zip");
+    // stored entry whose CRC does not match its data
+    raw_zip(&z, "f", 0, 3, 0, b"new");
+    let x = t.join("x");
+    fs::create_dir_all(&x).unwrap();
+    fs::write(x.join("f"), b"old").unwrap();
+    assert!(!ok(bin().arg("extract").arg(&z).arg("-o").arg(&x)));
+    // the copy that was there is intact, and no temp file is left
+    assert_eq!(fs::read(x.join("f")).unwrap(), b"old");
+    assert_eq!(fs::read_dir(&x).unwrap().count(), 1);
+    // a good entry replaces it
+    raw_zip(&z, "f", 0, 3, crc32fast::hash(b"new"), b"new");
+    assert!(ok(bin().arg("extract").arg(&z).arg("-o").arg(&x)));
+    assert_eq!(fs::read(x.join("f")).unwrap(), b"new");
+    assert_eq!(fs::read_dir(&x).unwrap().count(), 1);
+}
+
+#[test]
+fn extract_refuses_duplicate_names() {
+    let t = tmp("extract_dup");
+    let z = t.join("dup.zip");
+    deflate_zip(&z, &[("same", b"first"), ("same", b"second")]);
+    let x = t.join("x");
+    let out = bin()
+        .arg("extract")
+        .arg(&z)
+        .arg("-o")
+        .arg(&x)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("duplicate entry"));
+    assert!(!x.exists());
+}
+
+/// Where the file system ignores case, `a.txt` and `A.TXT` are one file:
+/// the second entry must not replace the first.
+#[test]
+fn extract_refuses_names_of_one_file() {
+    let t = tmp("extract_one_file");
+    let z = t.join("in.zip");
+    deflate_zip(&z, &[("a.txt", b"lower"), ("A.TXT", b"upper")]);
+    fs::write(t.join("probe"), b"").unwrap();
+    let ignores_case = t.join("PROBE").exists();
+    let x = t.join("x");
+    let out = bin()
+        .arg("extract")
+        .arg(&z)
+        .arg("-o")
+        .arg(&x)
+        .output()
+        .unwrap();
+    assert_eq!(fs::read(x.join("a.txt")).unwrap(), b"lower");
+    if ignores_case {
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("same file as \"a.txt\""));
+        assert_eq!(fs::read_dir(&x).unwrap().count(), 1);
+    } else {
+        assert!(out.status.success());
+        assert_eq!(fs::read(x.join("A.TXT")).unwrap(), b"upper");
+    }
+    // again over the files of the first run: these are replaced
+    let again = bin()
+        .arg("extract")
+        .arg(&z)
+        .arg("-o")
+        .arg(&x)
+        .output()
+        .unwrap();
+    assert_eq!(again.status.success(), !ignores_case);
+    assert_eq!(fs::read(x.join("a.txt")).unwrap(), b"lower");
+}
+
+#[test]
 fn entry_count_mismatch_refused() {
     let t = tmp("count_mismatch");
     let z = t.join("in.zip");

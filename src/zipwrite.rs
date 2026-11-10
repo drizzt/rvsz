@@ -272,6 +272,14 @@ fn remove_all(v: &[PathBuf]) {
     }
 }
 
+/// Runs `create` and tracks `tmp` if it made the file, both under one lock:
+/// the signal cleanup either runs before (and exits with the lock held, so
+/// `create` never runs) or after, and then finds the file in the list.
+pub fn create_tracked<T>(tmp: &Path, create: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+    let mut v = TEMP_FILES.lock().unwrap();
+    create().inspect(|_| v.push(tmp.to_path_buf()))
+}
+
 /// Creates and tracks a new temp file next to `dest`. `create_new` never
 /// opens an existing name, so a symlink planted there is not followed. If
 /// `dest` is a regular file, its owner (best effort) and mode carry over.
@@ -294,14 +302,7 @@ pub fn create_temp(dest: &Path) -> io::Result<(File, PathBuf)> {
         let mut o = fs::OpenOptions::new();
         o.read(true).write(true).create_new(true);
         sys::temp_mode(&mut o, old.is_some());
-        // open and track under one lock: the signal cleanup either runs
-        // before (and exits with the lock held, so this never runs) or
-        // after, and then finds the file in the list
-        let r = {
-            let mut v = TEMP_FILES.lock().unwrap();
-            o.open(&tmp).inspect(|_| v.push(tmp.clone()))
-        };
-        let f = match r {
+        let f = match create_tracked(&tmp, || o.open(&tmp)) {
             Ok(f) => f,
             Err(e) => {
                 if e.kind() == io::ErrorKind::AlreadyExists {

@@ -89,15 +89,9 @@ mod unix {
         fd_result(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) })
     }
 
-    /// Creates file `name` in `dir`. Whatever is there (a symlink, or a hard link
-    /// to someone else's file) is unlinked first, then O_EXCL makes sure the
-    /// new file is the one written.
-    pub fn create_file_at(dir: &Dir, name: &OsStr) -> io::Result<File> {
-        if let Err(err) = unlink_at(dir, name)
-            && err.kind() != io::ErrorKind::NotFound
-        {
-            return Err(err);
-        }
+    /// Creates file `name` in `dir`. O_EXCL fails on any existing name, a
+    /// symlink too, so the file written is always a new one.
+    pub fn create_new_at(dir: &Dir, name: &OsStr) -> io::Result<File> {
         let c = c_name(name)?;
         let flags =
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
@@ -105,6 +99,18 @@ mod unix {
         fd_result(unsafe {
             libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, 0o666 as libc::c_uint)
         })
+    }
+
+    /// Renames `from` to `to`, both in `dir`. Whatever is at `to` (a symlink,
+    /// or a hard link to someone else's file) is replaced, never written into.
+    pub fn rename_at(dir: &Dir, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        let (f, t) = (c_name(from)?, c_name(to)?);
+        let fd = dir.as_raw_fd();
+        // SAFETY: valid descriptor and NUL-terminated names
+        if unsafe { libc::renameat(fd, f.as_ptr(), fd, t.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Removes file `name` from `dir`, by name in the open directory, never
@@ -116,6 +122,28 @@ mod unix {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// What tells one file from every other: device and inode.
+    pub type FileId = (libc::dev_t, libc::ino_t);
+
+    /// Identity of what `name` is in `dir` (of a symlink, not of its
+    /// target), None if nothing is there.
+    pub fn file_id_at(dir: &Dir, name: &OsStr) -> io::Result<Option<FileId>> {
+        let c = c_name(name)?;
+        // SAFETY: plain data, all zeros is valid
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let flags = libc::AT_SYMLINK_NOFOLLOW;
+        // SAFETY: valid descriptor, NUL-terminated name and valid pointer
+        if unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, flags) } != 0 {
+            let err = io::Error::last_os_error();
+            return if err.kind() == io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(err)
+            };
+        }
+        Ok(Some((st.st_dev, st.st_ino)))
     }
 
     /// On SIGINT, SIGTERM or SIGHUP, removes unfinished temp files and exits
@@ -169,7 +197,9 @@ mod windows {
     use std::io;
     use std::os::windows::fs::OpenOptionsExt;
     use std::path::{Path, PathBuf};
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
 
     /// Positional I/O like `std::os::unix::fs::FileExt`. Unlike pread and
     /// pwrite, these move the file cursor: seek before the next plain write.
@@ -265,15 +295,9 @@ mod windows {
         Ok(p)
     }
 
-    /// Creates file `name` in `dir`. Whatever is there (a symlink, or a hard
-    /// link to someone else's file) is removed first; `create_new` then
-    /// fails if a new one appeared, and does not follow a link.
-    pub fn create_file_at(dir: &Dir, name: &OsStr) -> io::Result<File> {
-        if let Err(err) = unlink_at(dir, name)
-            && err.kind() != io::ErrorKind::NotFound
-        {
-            return Err(err);
-        }
+    /// Creates file `name` in `dir`. `create_new` fails on any existing
+    /// name and does not follow a link.
+    pub fn create_new_at(dir: &Dir, name: &OsStr) -> io::Result<File> {
         fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -281,8 +305,49 @@ mod windows {
             .open(dir.join(name))
     }
 
+    /// Renames `from` to `to`, both in `dir`. Whatever is at `to` (a symlink,
+    /// or a hard link to someone else's file) is replaced, never written into.
+    pub fn rename_at(dir: &Dir, from: &OsStr, to: &OsStr) -> io::Result<()> {
+        fs::rename(dir.join(from), dir.join(to))
+    }
+
     pub fn unlink_at(dir: &Dir, name: &OsStr) -> io::Result<()> {
         fs::remove_file(dir.join(name))
+    }
+
+    /// What tells one file from every other: volume serial number and file
+    /// index.
+    pub type FileId = (u32, u64);
+
+    fn file_id(f: &File) -> io::Result<FileId> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+        };
+        // SAFETY: plain data, all zeros is valid
+        let mut i: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid handle and pointer
+        if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut i) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let index = u64::from(i.nFileIndexHigh) << 32 | u64::from(i.nFileIndexLow);
+        Ok((i.dwVolumeSerialNumber, index))
+    }
+
+    /// Identity of what `name` is in `dir` (of a symlink, not of its
+    /// target), None if nothing is there.
+    pub fn file_id_at(dir: &Dir, name: &OsStr) -> io::Result<Option<FileId>> {
+        // no access rights asked: a file in use opens too. A directory
+        // needs FILE_FLAG_BACKUP_SEMANTICS
+        match fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir.join(name))
+        {
+            Ok(f) => file_id(&f).map(Some),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// On Ctrl+C, Ctrl+Break or console close, removes unfinished temp
