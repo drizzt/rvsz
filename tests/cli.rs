@@ -1594,6 +1594,33 @@ fn fifo_named_zip_does_not_hang() {
 }
 
 /// Two dirs and a deflate zip for the multi-input pack tests.
+/// A directory in the place of the output fails before the encode starts,
+/// not when the finished zip is renamed.
+#[test]
+fn pack_output_is_directory() {
+    let t = tmp("out_is_dir");
+    let src = t.join("src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("f"), b"x").unwrap();
+    let o = t.join("o");
+    fs::create_dir_all(&o).unwrap();
+    let out = bin()
+        .arg("pack")
+        .arg("-v")
+        .arg(&src)
+        .arg("-o")
+        .arg(&o)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("is a directory"), "{err}");
+    // -v prints this line when the encode starts
+    assert!(!err.contains("packing"), "{err}");
+    assert_eq!(fs::read_dir(&t).unwrap().count(), 2);
+    assert_eq!(fs::read_dir(&o).unwrap().count(), 0);
+}
+
 fn pack_inputs(t: &Path) -> [PathBuf; 3] {
     let (a, b, z) = (t.join("a"), t.join("b"), t.join("z.zip"));
     fs::create_dir_all(&a).unwrap();

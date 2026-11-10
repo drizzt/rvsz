@@ -438,6 +438,13 @@ fn pack(
     started: &dyn Fn(),
 ) -> io::Result<Outcome> {
     let (force, verbose) = (opts.force, opts.verbose);
+    // else found only by the final rename, after the whole encode
+    if dest.is_dir() {
+        return Err(io::Error::other(format!(
+            "output {} is a directory",
+            dest.display()
+        )));
+    }
     let (src, list) = if input.is_dir() {
         // the output would be packed into itself by the next run
         let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
