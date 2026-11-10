@@ -89,6 +89,74 @@ fn pack_verify_extract() {
     assert_eq!(first, fs::read(&z1).unwrap());
 }
 
+/// Bytes from a fixed seed, the same on every platform: words if `text`,
+/// else noise. Unlike `big` of the corpus, the words give the encoders
+/// literals, short matches and entropy tables to build, and the noise does
+/// not compress at all.
+fn seeded(text: bool, n: usize) -> Vec<u8> {
+    const WORDS: [&str; 16] = [
+        "rom",
+        "vault",
+        "zip",
+        "sector",
+        "track",
+        "disc",
+        "cartridge",
+        "bios",
+        "dump",
+        "header",
+        "checksum",
+        "region",
+        "revision",
+        "prototype",
+        "unlicensed",
+        "a",
+    ];
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut out = Vec::with_capacity(n + 16);
+    while out.len() < n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        if text {
+            out.extend_from_slice(WORDS[(x >> 60) as usize].as_bytes());
+            out.push(if x & 0xF00 == 0 { b'\n' } else { b' ' });
+        } else {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+/// Every other test compares this tool with itself. This one holds each
+/// platform and toolchain to what RomVault's own library writes for the
+/// same tree: size and CRC32 of the whole zip, taken from the output of
+/// `tools/oracle` (RVWorld a26ee86, `Oracle <dir> <zip> 4 zstd` and
+/// `... 4 trrnt`). If the tree changes, run the oracle on
+/// `target/tmp/romvault_bytes/src` again.
+#[test]
+fn bytes_match_romvault() {
+    let t = tmp("romvault_bytes");
+    let src = t.join("src");
+    corpus(&src);
+    fs::write(src.join("text"), seeded(true, 400_000)).unwrap();
+    fs::write(src.join("noise"), seeded(false, 100_000)).unwrap();
+    for (fmt, want) in [
+        ("rvzstd", (152_597, 0xD14C_053Cu32)),
+        ("trrntzip", (216_109, 0x3317_1129)),
+    ] {
+        let z = t.join(format!("{fmt}.zip"));
+        assert!(ok(bin()
+            .args(["pack", "--format", fmt])
+            .arg(&src)
+            .arg("-o")
+            .arg(&z)));
+        let b = fs::read(&z).unwrap();
+        assert_eq!((b.len(), crc32fast::hash(&b)), want, "{fmt}");
+    }
+}
+
 #[test]
 fn pack_verbose_lists_entries() {
     let t = tmp("pack_verbose_lists_entries");
