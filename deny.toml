@@ -18,6 +18,12 @@ ignore = [
     # libzstd can change the compressed bytes, and output must stay
     # byte-identical to RomVault.
     { id = "RUSTSEC-2026-0410", reason = "wasm32 only; pin needed for byte-identical output" },
+    # The flaw is in zlib's gzwrite.c (gzFile write path, gz_vacate after a
+    # write stall). rvsz calls deflate() and inflate directly and never uses
+    # the gzFile API. libz-sys stays pinned to 1.1.31 (zlib 1.3.2) because a
+    # newer zlib can change the deflate bytes, and TorrentZip output must stay
+    # byte-identical to RomVault.
+    { id = "RUSTSEC-2026-0544", reason = "gzFile API only, unused; pin needed for byte-identical output" },
 ]
 
 # ---------------------------------------------------------------------------
